@@ -6,13 +6,8 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 echo "==> NanoOS installer"
 echo "==> This assumes a jailbroken iPod nano 7G is connected and mounted."
 
-# Build NanoOS kernel
-echo "==> Building NanoOS kernel..."
-make -C "$ROOT/nanoos" clean
-make -C "$ROOT/nanoos"
-
-# Build and package NanoOS Loader
-echo "==> Building NanoOS Loader..."
+# Build and package
+echo "==> Building NanoOS kernel + loader..."
 cd "$ROOT/NanoOSLoader"
 ./package.sh
 

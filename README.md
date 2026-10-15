@@ -81,6 +81,17 @@ Until now, homebrew ran as apps inside RetailOS, limited to the OS heap and Appl
 - iPod nano 7th generation (2012)
 - Untethered jailbreak (see [wInd3x](https://github.com/freemyipod/wInd3x) and the [NanoApps](https://github.com/freemyipod/nanoapps) SDK community)
 - Linux computer with `sg3-utils` to drive the iPod over SCSI
+- [NanoApps SDK](https://github.com/freemyipod/nanoapps) cloned next to this repo
+
+### Repository layout
+
+```
+NanoOS/
+  nanoos/         # NanoOS bare-metal kernel
+  NanoOSLoader/   # RetailOS homebrew app that boots NanoOS
+  assets/         # Screenshots and icon
+  install.sh      # One-line installer
+```
 
 ### One-line install
 
@@ -98,7 +109,7 @@ cd NanoOS
    make
    ```
 
-2. Build and install the NanoOS Loader app:
+2. Build and package the NanoOS Loader app:
    ```sh
    cd ../NanoOSLoader
    ./package.sh
