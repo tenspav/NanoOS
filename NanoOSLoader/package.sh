@@ -5,8 +5,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 LOADER_DIR=$(realpath "$SCRIPT_DIR")
-NANOOS=$(realpath "$LOADER_DIR/../nanoos")
-NANOAPPS=$(realpath "$LOADER_DIR/../../NanoApps")
+NANOOS=$(realpath "$LOADER_DIR/../../nanoos")
+NANOAPPS=$(realpath "$LOADER_DIR/../../../NanoApps")
 
 echo "==> build NanoOS kernel"
 make -s -C "$NANOOS" all

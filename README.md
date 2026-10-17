@@ -44,6 +44,8 @@ Until now, homebrew ran as apps inside RetailOS, limited to the OS heap and Appl
 - Shows a horizontal game/app launcher.
 - Lets you pick a clock profile: **STOCK**, **SAFE**, or **MAX**.
 - Includes a live **devmode** screen showing CPU clock, GPU clock, RAM usage, and FPS.
+- **Drives the PowerVR MBX Lite GPU directly** (NanoGL): hardware-accelerated 3D rendering with textures, verified on the real device.
+- Saves hardware diagnostic reports to the iPod disk automatically.
 - Returns safely to the stock iPod OS by selecting **StockOS**.
 
 <p align="center">
@@ -62,6 +64,8 @@ Until now, homebrew ran as apps inside RetailOS, limited to the OS heap and Appl
 | Clock profile selector | Done |
 | Return to RetailOS | Done |
 | Devmode (CPU/GPU/RAM/FPS) | Done |
+| **GPU driver (PowerVR MBX Lite, NanoGL)** | **Done: triangle, textured quad, and continuous 3D world render on real hardware (v0.0.2 beta)** |
+| Auto diagnostic reports to disk | Done |
 | Load external game binaries | In research |
 | NAND driver for standalone apps | In research |
 | Audio driver | In research |

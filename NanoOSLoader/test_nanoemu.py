@@ -2,10 +2,10 @@
 """NanoOS Loader round trip in NanoEmu (emulator only, never a device).
 
 RetailOS (snap6) -> loader app in the Game Boy slot (a raw app needs an
-HBAppKind 1 slot: Blocks is a GL app, which gets no framebuffer) -> launcher UI checks ->
-StockOS via Home (OS exit to the RetailOS Home screen) -> relaunch ->
-ViceNano + Home -> kernel read from disk -> hw_shutdown_all + SRAM handoff ->
-bare-metal NanoOS launcher -> NanoOS StockOS -> reset back to RetailOS.
+HBAppKind 1 slot: Blocks is a GL app, which gets no framebuffer) -> opening it
+boots NanoOS (no Home press) -> kernel read from disk -> hw_shutdown_all + SRAM
+handoff -> NanoOS clock selector -> launcher -> Settings and DevMode -> NanoOS
+StockOS -> reset back to RetailOS.
 
 The dumped disk has no /Apps/NanoOS, and disk_patch.py can only overlay
 existing files, so the emulator build of the loader reads the kernel from
@@ -13,8 +13,8 @@ existing files, so the emulator build of the loader reads the kernel from
 in a patch file; the disk image is never written).
 
   --missing   instead boot the device build (/Apps/NanoOS/kernel.bin) and
-              check that a missing kernel shows the error screen and RetailOS
-              carries on (its own Home handling closes the app), no handoff.
+              check that a missing kernel shows the error screen and Home
+              takes RetailOS back to its Home screen, no handoff.
 
 Artifacts: apps/NanoOSLoader/build-emu/{screens/,nanoemu.log}.
 """
@@ -177,13 +177,13 @@ def wait_for(name, pred, timeout=10.0, every=.25, stable=False):
 
 
 WHITE, BG = (255, 255, 255), (26, 26, 26)
-ICONS = [(54, (38, 132, 255)), (162, (255, 136, 0)),
-         (270, (40, 184, 72)), (378, (128, 128, 128))]
+# NanoOS launcher icons (nanoos/src/main.c, 5 slots)
+ICONS = [(43, (38, 132, 255)), (129, (255, 136, 0)), (215, (40, 184, 72)),
+         (301, (128, 128, 128)), (387, (160, 76, 224))]
 
 
 def is_launcher(im, sel):
-    """the four circles in their colors, the white ring on `sel` only; false
-    while RetailOS's volume overlay covers the icons"""
+    """NanoOS launcher: the five circles, the white ring on `sel` only"""
     for i, (x, color) in enumerate(ICONS):
         if im.getpixel((x, 90)) != color:
             return False
@@ -195,13 +195,6 @@ def is_launcher(im, sel):
 def white_in(im, y0, y1, x0=0, x1=432):
     return any(im.getpixel((x, y)) == WHITE for x in range(x0, x1)
                for y in range(y0, y1))
-
-
-def launcher(sel, hint=True):
-    """loader launcher (hint line at y=220) or NanoOS's (none)"""
-    grey = lambda im: any(im.getpixel((x, y)) == (128, 128, 128)
-                          for x in range(0, 432, 2) for y in range(220, 228))
-    return lambda im: is_launcher(im, sel) and grey(im) == hint
 
 
 def home_page(land):
@@ -233,8 +226,13 @@ def to_home(tag):
     raise AssertionError(tag + ': RetailOS home screen never appeared')
 
 
+# draw_busy(): "BUSY..." (y=40) and the progress bar track (y=150)
+busy = lambda im: (white_in(im, 40, 48, 180, 252)
+                   and im.getpixel((370, 158)) in ((64, 64, 64), (40, 184, 72)))
+
+
 def open_loader(tag):
-    """home page 2, tap the Game Boy slot, wait for the loader launcher"""
+    """home page 2, tap the Game Boy slot; returns the log length at the tap"""
     print('Opening the loader (home page 2, Game Boy slot)...')
     for _ in range(6):
         # decide only on a settled home screen, never mid page-slide
@@ -245,144 +243,104 @@ def open_loader(tag):
         swipe(page > 2)
     else:
         raise AssertionError(tag + ': could not reach home page 2')
+    mark = len(tail_log())
     touch(24600, 17500, True)
     touch(24600, 17500, False)
-    return wait_for(tag + '_loader', launcher(0), 20, .5, stable=True)
+    return mark
 
 
+TITLE = 'NanoOS v0.0.2 beta by Tenspav'
 q('qmp_capabilities')
 time.sleep(3)
 save('01_retailos_boot', grab())
 to_home('02_retailos_home')
-loader_menu = open_loader('03')
-assert white_in(loader_menu, 16, 24), 'title missing'
+mark = open_loader('03')
 
 if MISSING:
-    key('right', 0)
-    wait_for('05_vicenano_selected', launcher(1))
-    key('h', 0)
-    err = wait_for('06_missing_kernel', lambda im: any(
+    wait_for('04_missing_kernel', lambda im: any(
         im.getpixel((x, y)) == (255, 80, 80)
-        for x in range(100, 332) for y in range(80, 88)), 5, .05)
-    # RetailOS acts on that Home press too and takes the app home; with no
-    # handoff to win the race that is where it ends, alive, without a reset
-    wait_for('07_retailos_home', lambda im: home_page(im) > 0)
+        for x in range(100, 332) for y in range(80, 88)), 20, .1)
+    key('h', 0)
+    wait_for('05_retailos_home', lambda im: home_page(im) > 0)
     q('quit')
     p.wait(timeout=10)
     assert 'reset: reloading the boot state' not in tail_log()
     if lost_keys:
         print(f'note: {lost_keys} key press(es) were lost inside QEMU and resent')
-    print('PASS: missing kernel -> error screen -> RetailOS home, no handoff/reset')
+    print('PASS: missing kernel -> error screen -> Home -> RetailOS home, no handoff/reset')
     sys.exit(0)
 
-print('Volume navigation (wraps both ways)...')
-# The first volume press after launch makes RetailOS build its volume overlay
-# (NAND resource loads, slow in NanoEmu) and the app's frame callback stalls;
-# a press inside the stall is missed. Warm up with one press, take either
-# outcome, then every press must register.
-key('right', 0)
-time.sleep(3)
-sel = 1 if wait_for('04_warmup', lambda im: launcher(0)(im) or launcher(1)(im),
-                    10, .5, stable=True).getpixel((162, 72)) == WHITE else 0
-print(f'  warm-up press {"registered" if sel else "missed (overlay build stall)"}')
-for k in ['right', 'right', 'right', 'right', 'left', 'left', 'right']:
-    sel = (sel + (1 if k == 'right' else 3)) % 4
-    key(k, 0)
-    wait_for(f'05_nav_{sel}_{k}', launcher(sel))
-while sel:
-    key('left', 0)
-    sel -= 1
-    wait_for(f'05_back_{sel}', launcher(sel))
-
-print('Home on StockOS -> RetailOS takes the app back to its Home screen...')
-key('h', 0)
-wait_for('10_stockos_home_exit', lambda im: home_page(im) > 0)
-assert 'reset: reloading the boot state' not in tail_log(), 'StockOS reset instead of exiting'
-
-open_loader('11')
-
-print('ViceNano + Home -> BUSY -> kernel load -> handoff -> NanoOS...')
-key('right', 0)
-wait_for('13_vicenano', launcher(1))
-# "BUSY..." (y=40) and the progress bar track (y=150) of draw_busy(). It is
-# up only a few frames (the handoff must beat RetailOS's own Home handling),
-# so catching it is best effort; the handoff itself is asserted below.
-busy = lambda im: (white_in(im, 40, 48, 180, 252)
-                   and im.getpixel((370, 158)) in ((64, 64, 64), (40, 184, 72)))
-nanoos_up = lambda im: not busy(im) and white_in(im, 16, 24) and not launcher(1)(im)
+print('Loader boots NanoOS on open: BUSY -> kernel load -> handoff -> clock selector...')
+# BUSY is up only a few frames, so catching it is best effort; the handoff
+# itself is asserted below
+selector = lambda im: (not busy(im) and all(im.getpixel(xy) == BG for xy in
+                           [(4, 4), (427, 4), (4, 235), (427, 235), (216, 80)])
+                       and white_in(im, 16, 24)
+                       and white_in(im, 56, 64) and white_in(im, 100, 108))
 busy_seen = False
-for attempt in range(3):
-    homes = tail_log().count('button home pressed')
-    q('human-monitor-command', {'command-line': 'sendkey h 300'})
-    end = time.time() + 4
-    while time.time() < end:
-        im = grab()
-        land = im.transpose(Image.ROTATE_90)
-        if busy(land) and not busy_seen:
-            save('14_busy', im)
-            busy_seen = True
-        if busy_seen or not launcher(1)(land):
-            break
-        time.sleep(.03)
-    if busy_seen or tail_log().count('button home pressed') > homes:
+end = time.time() + 20
+while time.time() < end:
+    im = grab()
+    land = im.transpose(Image.ROTATE_90)
+    if busy(land):
+        if not busy_seen:
+            save('04_busy', im)
+        busy_seen = True
+    elif selector(land):
         break
-    lost_keys += 1
-    print('  (h: not delivered by QEMU, resending)')
-else:
-    raise AssertionError('h: QEMU never delivered the key')
+    time.sleep(.03)
 print(f'  BUSY frame {"captured" if busy_seen else "not captured (on screen only a few frames)"}')
-# NanoOS's own first frame: the BUSY screen is gone and NanoOS's title is up
-nano = wait_for('15_nanoos_after_handoff', nanoos_up, 15)
+sel = wait_for('05_nanoos_clock_selector', selector, 15)
 time.sleep(1)
 # the PC sampler (4 Hz) must keep finding the CPU inside the loaded kernel
 # image at 0x08000000, in SVC mode as the SRAM trampoline leaves it (the
 # sampler prints the mode bits only), and no reset may have happened
 kernel_end = 0x08000000 + (ROOT / 'nanoos/build/kernel.bin').stat().st_size
 log = tail_log()
-home_at = log.rindex('button home pressed')
 samples = [(int(pc, 16), int(cpsr, 16)) for pc, cpsr in re.findall(
-    r'\[nano7-pc\] pc=0x([0-9a-f]+) cpsr=0x([0-9a-f]+)', log[home_at:])]
+    r'\[nano7-pc\] pc=0x([0-9a-f]+) cpsr=0x([0-9a-f]+)', log[mark:])]
 last = samples[-4:]
 assert len(last) == 4 and all(0x08000000 <= pc < kernel_end and cpsr & 0x1f == 0x13
                               for pc, cpsr in last), \
     f'CPU not in NanoOS after the handoff: {[(hex(a), hex(b)) for a, b in last]}'
 print(f'  PC sampler: last {len(last)} samples in NanoOS '
       f'(0x08000000..0x{kernel_end:08x}, SVC): {[hex(pc) for pc, _ in last]}')
-assert 'reset: reloading the boot state' not in log, 'reset instead of handoff'
+assert 'reset: reloading the boot state' not in log[mark:], 'reset instead of handoff'
+assert 'button home pressed' not in log[mark:], 'boot needed a Home press'
 
-# nanoos/ is under active development; its v0.0.1 beta launcher (spec) gets the
-# full round trip, any other first screen only the handoff checks above
-if launcher(0, hint=False)(nano):
-    diff = [(x, y) for x in range(432) for y in range(200)
-            if nano.getpixel((x, y)) != loader_menu.getpixel((x, y))]
-    assert not diff, f'NanoOS launcher differs from the loader above y=200: {diff[:5]}'
-    print('Inside NanoOS: ViceNano placeholder, back, StockOS -> reset to RetailOS...')
+print('Inside NanoOS: STOCK profile, Settings, DevMode, StockOS -> reset...')
+key('ret', 0)
+launch = wait_for('06_nanoos_launcher', lambda im: is_launcher(im, 0), 10)
+assert white_in(launch, 16, 24, (432 - len(TITLE + ' | STOCK') * 8) // 2,
+                (432 + len(TITLE + ' | STOCK') * 8) // 2)
+for i in range(1, 4):
     key('right', 0)
-    wait_for('16_nanoos_vicenano', launcher(1, hint=False))
-    key('ret', 0)
-    wait_for('17_nanoos_placeholder', lambda im: im.getpixel((40, 90)) == BG
-             and white_in(im, 132, 140))
-    key('h', 0)
-    wait_for('18_nanoos_back', launcher(1, hint=False))
-    key('left', 0)
-    wait_for('19_nanoos_stockos', launcher(0, hint=False))
-    key('ret', 0)
-    wait_for('20_retailos_restored', lambda im: not is_launcher(im, 0), 15)
-    to_home('21_retailos_home')
-    roundtrip = True
-else:
-    print('  NanoOS shows a screen other than the v0.0.1 beta launcher (nanoos/ changed);'
-          ' NanoOS-side StockOS round trip skipped')
-    roundtrip = False
+    wait_for(f'07_nanoos_sel_{i}', lambda im, i=i: is_launcher(im, i))
+key('ret', 0)
+wait_for('08_nanoos_settings', lambda im: im.getpixel((40, 90)) == BG
+         and white_in(im, 132, 140))
+key('h', 0)
+wait_for('09_nanoos_back', lambda im: is_launcher(im, 3))
+key('right', 0)
+wait_for('10_nanoos_devmode_sel', lambda im: is_launcher(im, 4))
+key('ret', 0)
+wait_for('11_nanoos_devmode', lambda im: im.getpixel((40, 90)) == BG
+         and white_in(im, 48, 56, 40, 64) and white_in(im, 128, 136, 112, 200), 10)
+key('h', 0)
+wait_for('12_nanoos_back', lambda im: is_launcher(im, 4))
+key('right', 0)
+wait_for('13_nanoos_stockos', lambda im: is_launcher(im, 0))
+key('ret', 0)
+wait_for('14_retailos_restored', lambda im: not is_launcher(im, 0), 15)
+to_home('15_retailos_home')
 
 q('quit')
 p.wait(timeout=10)
 log_file.close()
 log = log_path.read_text(errors='replace')
-if roundtrip:
-    assert '[nano7-ui] reset: reloading the boot state' in log, 'no reset back to RetailOS'
+assert '[nano7-ui] reset: reloading the boot state' in log[mark:], 'no reset back to RetailOS'
 if lost_keys:
     print(f'note: {lost_keys} key press(es) were lost inside QEMU and resent')
-print('PASS: loader launcher, volume nav, Home->RetailOS, ViceNano+Home -> BUSY -> '
-      'kernel load -> shutdown + SRAM handoff -> NanoOS running'
-      + (' -> NanoOS StockOS -> reset -> RetailOS' if roundtrip else ''))
+print('PASS: loader opens -> BUSY -> kernel load -> shutdown + SRAM handoff (no Home) -> '
+      'NanoOS clock selector -> launcher v0.0.2 beta -> Settings -> DevMode -> '
+      'StockOS -> reset -> RetailOS')

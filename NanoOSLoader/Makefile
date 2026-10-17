@@ -2,11 +2,13 @@
 #   make                          device build, loads /Apps/NanoOS/kernel.bin
 #   make KERNEL_PATH=/some/file   other kernel path (the emulator test uses one,
 #                                 since the dumped disk has no /Apps/NanoOS)
-# Reuses local copies of probe/chainloader shutdown.c + handoff.S and nanoos's font.
+# Reuses probe/chainloader's shutdown.c + handoff.S and nanoos's font.
+# Paths are relative to this Makefile so the directory can be symlinked into
+# NanoApps/apps/ for packaging without breaking the build.
 LOADER_DIR := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))
-NANOAPPS   ?= $(realpath $(LOADER_DIR)/../../NanoApps)
-CHAIN      := $(LOADER_DIR)/chainloader
-NANOOS     := $(LOADER_DIR)/../nanoos
+NANOAPPS   ?= $(realpath $(LOADER_DIR)/../../../NanoApps)
+CHAIN      := $(LOADER_DIR)/../../probe/chainloader
+NANOOS     := $(LOADER_DIR)/../../nanoos
 BUILD      ?= $(LOADER_DIR)/build
 
 APP_NAME    := NanoOSLoader

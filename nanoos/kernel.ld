@@ -34,7 +34,10 @@ SECTIONS
         __data_end = .;
     } > DRAM
 
-    .bss (NOLOAD) : {
+    /* data from 0x08010000 on: NanoEmu's real iPod mode charges uncached
+     * DRAM time there, while code below runs at full speed */
+    ASSERT(. <= 0x08010000, "code/data past 0x08010000")
+    .bss 0x08010000 (NOLOAD) : {
         . = ALIGN(4);
         __bss_start = .;
         *(.bss*)
