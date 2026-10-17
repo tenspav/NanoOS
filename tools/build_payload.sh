@@ -1,0 +1,1 @@
+../installer/build_payload.sh

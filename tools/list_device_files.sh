@@ -1,0 +1,1 @@
+../installer/list_device_files.sh

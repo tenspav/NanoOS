@@ -1,137 +1,56 @@
-<p align="center">
-  <img src="assets/icon.png" width="128" alt="NanoOS icon">
-</p>
+# NanoOS v0.0.2 beta
 
-<h1 align="center">NanoOS</h1>
+Freestanding ARM kernel for iPod nano 7G, linked at `0x08000000`, with MMU
+and caches disabled. The 432x240 landscape UI rotates into the native
+240x432 LCD scanout at `0x08200000`. Requires the ARM bare-metal toolchain,
+Python 3/Pillow, and the sibling NanoApps SDK.
 
-<p align="center">
-  A custom, bare-metal launcher and OS layer for the <b>iPod nano 7th generation</b> (2012).<br>
-  Runs alongside the stock iPod OS. No NAND modification required.
-</p>
+## Drivers and DevMode
 
-<p align="center">
-  <img alt="status" src="https://img.shields.io/badge/status-boots%20on%20real%20hardware-brightgreen">
-  <img alt="target" src="https://img.shields.io/badge/target-iPod%20nano%207G-lightgrey">
-  <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
-</p>
+Hardware driver implementations cover LCD, touch, buttons, audio, NAND,
+USB, Bluetooth HID, and MBX GPU. Drivers are polled with bounded waits.
+Audio provides a codec probe and CPU-fed tone; NAND supports raw reads and
+refuses writes. USB is probe-only (NanoEmu has no DWC2 model); Bluetooth
+currently targets the emulator's known HID peer, without general pairing.
+MBX provides scene submission and GPU test support. These are development
+interfaces, not a complete peripheral stack; see [DRIVER_PORT.md](DRIVER_PORT.md).
 
----
+Every boot starts with a STOCK/SAFE/MAX clock selector. Nominal CPU/GPU
+rates are 342/133, 342/171, and 342/266 MHz respectively. Confirmation
+changes only the GPU rate fields at `0x3C50001C`, preserving gates and the
+memory domain; CPU clocks remain stock. Selection lasts for this boot only.
+The profile names do not establish hardware stability.
 
-## What is NanoOS?
+Volume down/up selects; Home (or both volume buttons together) confirms.
+NanoEmu also maps Left/Right and Enter to these controls. The five-entry
+menu contains StockOS, ViceNano, PS1Emu, Settings, and DevMode. Home returns
+from a scene; StockOS requests a reset to RetailOS. DevMode shows clocks,
+memory, FPS, and diagnostics; Vol+ opens Drivers, then the MBX GPU test;
+Vol- returns to stats.
 
-NanoOS is a tiny custom operating system that boots on a jailbroken iPod nano 7G. It is loaded from the stock iPod OS through a homebrew app called **NanoOS Loader**, performs a warm hardware handoff, and runs in bare-metal ARM mode with full control of the CPU, GPU, and RAM.
+## Integrated ViceNano M8 build
 
-It is the first step toward running homebrew games and apps outside of Apple's RetailOS, without dual-booting and without touching the NAND flash.
-
-## Why it matters
-
-The iPod nano 7G is a powerful little device hiding inside a music-player body:
-
-| | |
-|---|---|
-| **SoC** | Samsung S5L8747, ARM Cortex-A5 @ up to 684 MHz |
-| **RAM** | 64 MB DRAM (40 MB usable by apps) |
-| **GPU** | PowerVR MBX Lite, unlockable to 266 MHz |
-| **Display** | 240 x 432 @ 60 Hz |
-| **Storage** | 16 GB NAND flash |
-| **Wireless** | Bluetooth classic + BLE, FM radio |
-
-Until now, homebrew ran as apps inside RetailOS, limited to the OS heap and Apple's UI sandbox. NanoOS breaks out of that sandbox and gives homebrew direct hardware access, unlocking the full performance of the device.
-
-## What it does today
-
-- Boots from RetailOS through a homebrew loader icon on the home screen.
-- Shows a horizontal game/app launcher.
-- Lets you pick a clock profile: **STOCK**, **SAFE**, or **MAX**.
-- Includes a live **devmode** screen showing CPU clock, GPU clock, RAM usage, and FPS.
-- **Drives the PowerVR MBX Lite GPU directly** (NanoGL): hardware-accelerated 3D rendering with textures, verified on the real device.
-- Saves hardware diagnostic reports to the iPod disk automatically.
-- Returns safely to the stock iPod OS by selecting **StockOS**.
-
-<p align="center">
-  <img src="assets/launcher.png" width="180" alt="NanoOS launcher">
-  <img src="assets/devmode.png" width="180" alt="NanoOS devmode">
-  <img src="assets/retailos-return.png" width="180" alt="Return to RetailOS">
-</p>
-
-## Current progress
-
-| Feature | Status |
-|---|---|
-| Boot from RetailOS | Done |
-| Warm hardware handoff | Done |
-| Launcher UI | Done |
-| Clock profile selector | Done |
-| Return to RetailOS | Done |
-| Devmode (CPU/GPU/RAM/FPS) | Done |
-| **GPU driver (PowerVR MBX Lite, NanoGL)** | **Done: triangle, textured quad, and continuous 3D world render on real hardware (v0.0.2 beta)** |
-| Auto diagnostic reports to disk | Done |
-| Load external game binaries | In research |
-| NAND driver for standalone apps | In research |
-| Audio driver | In research |
-| Bluetooth driver inside NanoOS | In research |
-
-## Future plans
-
-1. **Game launcher** — boot ViceNano, emulators, and homebrew directly from NanoOS.
-2. **Full hardware drivers** — LCD, touch, buttons, audio, NAND, GPU, Bluetooth.
-3. **Standalone mode** — run games without going through RetailOS first.
-4. **Handheld cradle** — 3D-printed case + Bluetooth gamepad + battery.
-
-## Installation
-
-### Requirements
-
-- iPod nano 7th generation (2012)
-- Untethered jailbreak (see [wInd3x](https://github.com/freemyipod/wInd3x) and the [NanoApps](https://github.com/freemyipod/nanoapps) SDK community)
-- Linux computer with `sg3-utils` to drive the iPod over SCSI
-- [NanoApps SDK](https://github.com/freemyipod/nanoapps) cloned next to this repo
-
-### Repository layout
-
-```
-NanoOS/
-  nanoos/         # NanoOS bare-metal kernel
-  NanoOSLoader/   # RetailOS homebrew app that boots NanoOS
-  assets/         # Screenshots and icon
-  install.sh      # One-line installer
-```
-
-### One-line install
+From the repository root:
 
 ```sh
-git clone https://github.com/tenspav/NanoOS.git
-cd NanoOS
-./install.sh
+python3 nanoos/installer/build_payload.py
+python3 nanoos/installer/patch_disk_emu.py --mode all
+python3 nanoos/installer/list_device_files.py
 ```
 
-### Manual install
+The installer links ViceNano M8 into the full NanoOS kernel and stages the
+loader, kernel, and converted assets under `nanoos/installer/dist/Apps/`.
+Select **ViceNano** in the NanoOS menu to enter M8 (title, MBX triangle,
+and world preview); Home exits to NanoOS. PS1Emu and Settings remain
+placeholders. This is not a complete game port.
 
-1. Build the NanoOS kernel:
-   ```sh
-   cd nanoos
-   make
-   ```
+`make -C nanoos` builds the standalone kernel, whose ViceNano scene is a
+placeholder. `nanoos/run-in-nanoemu.sh STOCK` (also SAFE/MAX) runs its
+emulator regression; it does not test the integrated installer bundle.
+NanoEmu needs a built `emulator/build/qemu-system-arm`, snap6 dumps, disk
+and resource images. Rebuild emulator changes with `emulator/build.sh`.
 
-2. Build and package the NanoOS Loader app:
-   ```sh
-   cd ../NanoOSLoader
-   ./package.sh
-   ```
-
-3. Copy the packaged app and kernel to the iPod:
-   ```sh
-   sudo cp -r /tmp/hbapps/Apps /mnt/ipod/
-   ```
-
-4. Reboot the iPod. The **NanoOS** icon appears on the home screen.
-
-## Credits
-
-- NanoOS is built on top of the jailbreak and homebrew work from the **wInd3x** and **NanoApps** communities.
-- Hardware research powered by [NanoEmu](https://github.com/tenspav/NanoEmu).
-- Device firmware remains the property of Apple Inc.
-
-## Disclaimer
-
-This is independent research and interoperability work on hardware owned by the user. It is not affiliated with Apple Inc. "iPod" is a trademark of Apple Inc.
+See [INSTALL_IPOD.md](INSTALL_IPOD.md) for integrated bundle testing,
+device file transfer, and rollback. Validation described here is emulator
+validation only. Real hardware operation, driver behavior, clock stability,
+and reset behavior remain unverified.
