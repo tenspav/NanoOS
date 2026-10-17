@@ -1,4 +1,4 @@
-# NanoOS v0.0.0
+# NanoOS v0.0.1 beta
 
 Build the freestanding ARM kernel with `make -C nanoos`. Output:
 `nanoos/build/kernel.bin`, linked at physical `0x08000000`. Requires

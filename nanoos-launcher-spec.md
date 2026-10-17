@@ -1,4 +1,4 @@
-# NanoOS Launcher v0.0.0 Spec
+# NanoOS Launcher v0.0.1 beta Spec
 
 Goal: first bootable NanoOS kernel that shows a simple game-selection launcher and can return to the stock iPod OS.
 
@@ -17,7 +17,7 @@ Goal: first bootable NanoOS kernel that shows a simple game-selection launcher a
 ## Top bar
 
 - One line of text at the top, centered horizontally:
-  `NanoOS v0.0.0 by Tenspav`
+  `NanoOS v0.0.1 beta by Tenspav`
 - Font: built-in 8x8 bitmap font. White color.
 - Also shows the active clock profile: STOCK, SAFE or MAX.
 
@@ -73,7 +73,7 @@ Goal: first bootable NanoOS kernel that shows a simple game-selection launcher a
 - `nanoos/src/reset.c` - safe return to RetailOS.
 - `nanoos/Makefile` - cross compile with the existing arm-none-eabi toolchain.
 
-## Non-goals for v0.0.0
+## Non-goals for v0.0.1 beta
 
 - Real image icons.
 - Loading external game binaries.

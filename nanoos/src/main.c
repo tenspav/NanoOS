@@ -11,14 +11,14 @@ static const struct {
     const char *name, *title, *speeds;
     uint32_t cpu, gpu;
 } profiles[] = {
-    {"STOCK", "NanoOS v0.0.0 by Tenspav | STOCK", "342 MHz CPU / 133 MHz GPU", 0x40009001u, 0xe0010000u},
-    {"SAFE", "NanoOS v0.0.0 by Tenspav | SAFE", "684 MHz CPU / 171 MHz GPU", 0x40009000u, 0xd0030000u},
-    {"MAX", "NanoOS v0.0.0 by Tenspav | MAX", "684 MHz CPU / 266 MHz GPU", 0x40009000u, 0xe0000000u},
+    {"STOCK", "NanoOS v0.0.1 beta by Tenspav | STOCK", "342 MHz CPU / 133 MHz GPU", 0x40009001u, 0xe0010000u},
+    {"SAFE", "NanoOS v0.0.1 beta by Tenspav | SAFE", "684 MHz CPU / 171 MHz GPU", 0x40009000u, 0xd0030000u},
+    {"MAX", "NanoOS v0.0.1 beta by Tenspav | MAX", "684 MHz CPU / 266 MHz GPU", 0x40009000u, 0xe0000000u},
 };
 static unsigned active_profile;
 static void clock_selector(unsigned selected) {
     lcd_clear(0xff1a1a1a);
-    lcd_center(16, "NanoOS v0.0.0 by Tenspav", WHITE);
+    lcd_center(16, "NanoOS v0.0.1 beta by Tenspav", WHITE);
     lcd_center(56, "Choose clock profile", WHITE);
     for (unsigned i = 0; i < 3; ++i) {
         int x = 48 + (int)i * 144;

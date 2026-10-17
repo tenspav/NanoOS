@@ -86,7 +86,7 @@ What the test checks:
 6. The handoff proof: the 4 Hz PC sampler's last 4 samples all fall inside the
    loaded kernel image (0x08000000 + size) in SVC mode, with no reset in
    between.
-7. If NanoOS shows the v0.0.0 launcher, the test also checks it pixel for pixel
+7. If NanoOS shows the v0.0.1 beta launcher, the test also checks it pixel for pixel
    against the loader's (above the hint line). It then walks NanoOS'
    placeholder, StockOS and reset back to RetailOS. `nanoos/` is under active
    development, and with any other first screen this step is skipped and the

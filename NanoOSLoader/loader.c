@@ -23,7 +23,7 @@
  * short volume tap can fall inside a stall and be missed; press a bit longer.
  *
  * ViceNano / PS1Emu / Settings all boot NanoOS; inside it they are the
- * placeholders of the v0.0.0 spec. The boot runs over several frames so the
+ * placeholders of the v0.0.1 beta spec. The boot runs over several frames so the
  * screen always shows where it is (CLAUDE.md "BUSY..." rule):
  *   1. BUSY drawn the frame the button is seen
  *   2. read NANOOS_KERNEL_PATH whole into an OS-heap staging buffer
@@ -134,7 +134,7 @@ static char *put_uint(char *p, uint32_t v)
 static void draw_launcher(void)
 {
     clear(BG);
-    center(16, "NanoOS v0.0.0 by Tenspav", WHITE);
+    center(16, "NanoOS v0.0.1 beta by Tenspav", WHITE);
     for (int i = 0; i < 4; ++i) {
         int x = W / 8 + i * (W / 4);
         if (i == selected) circle(x, 112, 41, WHITE);

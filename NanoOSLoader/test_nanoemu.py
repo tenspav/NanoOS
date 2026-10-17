@@ -350,7 +350,7 @@ print(f'  PC sampler: last {len(last)} samples in NanoOS '
       f'(0x08000000..0x{kernel_end:08x}, SVC): {[hex(pc) for pc, _ in last]}')
 assert 'reset: reloading the boot state' not in log, 'reset instead of handoff'
 
-# nanoos/ is under active development; its v0.0.0 launcher (spec) gets the
+# nanoos/ is under active development; its v0.0.1 beta launcher (spec) gets the
 # full round trip, any other first screen only the handoff checks above
 if launcher(0, hint=False)(nano):
     diff = [(x, y) for x in range(432) for y in range(200)
@@ -371,7 +371,7 @@ if launcher(0, hint=False)(nano):
     to_home('21_retailos_home')
     roundtrip = True
 else:
-    print('  NanoOS shows a screen other than the v0.0.0 launcher (nanoos/ changed);'
+    print('  NanoOS shows a screen other than the v0.0.1 beta launcher (nanoos/ changed);'
           ' NanoOS-side StockOS round trip skipped')
     roundtrip = False
 

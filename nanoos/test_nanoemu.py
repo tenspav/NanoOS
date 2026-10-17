@@ -158,7 +158,7 @@ for address, expected in zip((0x3c500000, 0x3c50001c), profiles[profile]):
     assert actual == expected, (hex(address), hex(actual), hex(expected))
 print(f'PASS: {profile} CPU/GPU register values')
 launcher = shot('05_launcher_' + profile, landscape=True)
-title = 'NanoOS v0.0.0 by Tenspav | ' + profile
+title = 'NanoOS v0.0.1 beta by Tenspav | ' + profile
 assert_text_visible(launcher, (432 - len(title) * 8) // 2, 16, title)
 assert launcher.getpixel((420, 220)) == (26, 26, 26)
 assert launcher.getpixel((43, 90)) == (38, 132, 255)

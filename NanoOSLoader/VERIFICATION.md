@@ -64,9 +64,9 @@ PASS: loader launcher, volume nav, Home->RetailOS, ViceNano+Home -> BUSY -> kern
 
 ## Notes / limitations observed
 
-- The loader does **not** show the NanoOS v0.0.0 launcher spec screen in this build: NanoOS currently boots to a different first screen, so the test script skipped the NanoOS-side StockOS/reset round trip and reported:
+- The loader does **not** show the NanoOS v0.0.1 beta launcher spec screen in this build: NanoOS currently boots to a different first screen, so the test script skipped the NanoOS-side StockOS/reset round trip and reported:
   ```
-  NanoOS shows a screen other than the v0.0.0 launcher (nanoos/ changed); NanoOS-side StockOS round trip skipped
+  NanoOS shows a screen other than the v0.0.1 beta launcher (nanoos/ changed); NanoOS-side StockOS round trip skipped
   ```
   This is expected per `README.md` when `nanoos/` changes.
 - The handoff itself is fully verified: the CPU is running the loaded kernel at `0x08000000` in SVC mode with no reset.
