@@ -12,4 +12,17 @@
 int spi_xfer(uint32_t base, const uint8_t *tx, uint8_t *rx, unsigned n,
              uint32_t us);
 extern uint32_t spi_timeouts;
+/* Round 12, touch port only (the codec's timing is unchanged): CS setup
+ * after select, hold before deselect and minimum CS-high time after it,
+ * timer-based (delay_us). Diagnostic values for the MMU/D-cache touch
+ * regression, not a chip specification: tune after hardware feedback. */
+#ifndef TOUCH_CS_SETUP_US
+#define TOUCH_CS_SETUP_US 5u
+#endif
+#ifndef TOUCH_CS_HOLD_US
+#define TOUCH_CS_HOLD_US 5u
+#endif
+#ifndef TOUCH_CS_HIGH_US
+#define TOUCH_CS_HIGH_US 10u
+#endif
 #endif

@@ -13,14 +13,16 @@
  *   +0x0c chip select, bit1 set = deselected
  *   +0x10 TX byte, +0x20 RX byte, +0x34 / +0x4c per-byte lengths
  * FIFOs flushed and drained, then per byte +0x34 = 1, TX empty, +0x10 =
- * byte, +0x4c = 1, RX non-empty, pop. */
+ * byte, +0x4c = 1, RX non-empty, pop.
+ * Round 12: the touch port gets CS setup/hold/high delays (spi.h). */
 #define R(b, o) (*(volatile uint32_t *)((b) + (o)))
 uint32_t spi_timeouts;
 int spi_xfer(uint32_t base, const uint8_t *tx, uint8_t *rx, unsigned n,
              uint32_t us) {
     volatile uint32_t *st = &R(base, 0x08);
-    int ok = 0;
+    int ok = 0, touch = base == SPI_TOUCH;
     R(base, 0x0c) &= ~2u;               /* select */
+    if (touch) delay_us(TOUCH_CS_SETUP_US);
     R(base, 0x04) &= ~0x60u;            /* polled mode */
     R(base, 0x00) |= 0xcu;              /* flush; levels must read 0 */
     if (wait_until(st, 0xffc0u, 0, us) != WAIT_OK) goto out;
@@ -37,8 +39,10 @@ int spi_xfer(uint32_t base, const uint8_t *tx, uint8_t *rx, unsigned n,
     ok = 1;                             /* last byte in: TX is empty too */
 out:
     if (!ok) ++spi_timeouts;
+    if (touch) delay_us(TOUCH_CS_HOLD_US);
     R(base, 0x04) &= 0xffbffffeu;
     R(base, 0x0c) |= 2u;                /* deselect: the touch controller
                                          * releases its ready line here */
+    if (touch) delay_us(TOUCH_CS_HIGH_US);   /* before the next select */
     return ok;
 }

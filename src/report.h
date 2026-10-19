@@ -7,8 +7,9 @@
  * 0x0af38000, untouched by RetailOS at runtime, outside the GPU's 32 MB
  * window). Whether it survives the WDT reset and the RetailOS boot is the
  * open question: no magic at the loader = it did not. Shared with
- * apps/NanoOSLoader/loader.c; the D-cache is off in NanoOS, so plain stores
- * reach DRAM before the reset. */
+ * apps/NanoOSLoader/loader.c. NanoOS maps this region write-back cached
+ * (mmu.c): a writer cleans the D-cache (dcache_clean_all) for its report
+ * to reach DRAM before a reset other than reset_stockos(). */
 #define RPT_BASE 0x0ae10000u
 #define RPT_SLOTS 5u
 #define RPT_DATA 0x1000u      /* header page, then the slots */

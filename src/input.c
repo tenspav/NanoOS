@@ -66,7 +66,7 @@ unsigned input_i2c_n;
  * 1 us each (round 11 RE); 50 us keeps a margin. */
 #define I2C_GAP_US 50u
 #define I2C_RDY_US 200u    /* +0x10 = 0 before a START (measured) */
-#define I2C_STOP_US 5000u  /* RetailOS: 100 ms, STOP re-issued */
+#define I2C_STOP_US 100000u /* RetailOS: 100 ms, STOP re-issued (round 10) */
 #define I2C_TRIES 2u        /* register-read attempts per poll */
 /* Each register read costs ~1.6 ms of blocked CPU on the device's bus (two
  * 500 us gaps, 90 us bytes, retries): at a steady 50 Hz that was a third
@@ -93,14 +93,15 @@ static COLD void i2c_init(void) {
     I2C(0x00) = 0x181; I2C(0x04) = 0x10; I2C(0x28) = 0;
     I2C(0x20) = I2C_BYTE_DONE | I2C_STOP_DONE;
 }
-/* Byte done: +0x20 bit8 only, as RetailOS's ISR. Accepting IICCON bit4 (the
- * classic Samsung pending flag) as well ended waits early on a stale bit:
- * the device then "read" the address byte 0xE7 as data (BT round 2), so
- * Home's reg7 level was garbage. */
-static COLD int byte_done(void) {   /* 3 callers */
+/* Byte done: +0x20 bit8, or (round 10b) IICSTAT bit5 (busy) clear: the
+ * exit conditions of RetailOS's polled wait 0x22000588 (its third, +0x20
+ * bit13, is the STOP wait's). Never IICCON bit4 (the classic Samsung
+ * pending flag): it ended waits early on a stale bit and the device then
+ * "read" the address byte 0xE7 as data (BT round 2). bt.c i2c_byte too. */
+static COLD int byte_done(void) {   /* 4 callers */
     uint32_t t0 = USEC;
     for (uint32_t polls = 0; polls < I2C_BYTE_US * 64u; ++polls) {
-        if (I2C(0x20) & I2C_BYTE_DONE) return 1;
+        if ((I2C(0x20) & I2C_BYTE_DONE) || !(I2C(0x04) & 0x20u)) return 1;
         if (USEC - t0 >= I2C_BYTE_US) break;
     }
     ++input_debug.to_byte;
@@ -117,22 +118,24 @@ static SMALL void failed(unsigned stage) {
  * ack bits), +0x20 W1C, IICCON written again; ack 0x80 = ACK, 0 = NACK
  * the byte being read */
 static COLD void resume_ack(uint32_t ack) {
-    uint32_t c = (I2C(0x00) & ~0x90u) | ack;
-    I2C(0x00) = c;
+    I2C(0x00) = (I2C(0x00) & ~0x90u) | ack;
     I2C(0x20) = I2C_BYTE_DONE;
-    I2C(0x00) = c;
+    I2C(0x00) = I2C(0x00);              /* round 10: reread, as the ISR */
 }
 static SMALL void resume(void) { resume_ack(0x80u); }
 static SMALL int acked(void) { return !(I2C(0x04) & 1); }
-/* mode 0xd0 (TX) or 0x90 (RX). STOP re-issued every ms until done:
+/* mode 0xd0 (TX) or 0x90 (RX). IICCON bit13 (STOP-done event) is set
+ * here only, never at START (round 10, RetailOS's ISR). STOP re-issued
+ * every ms until done, up to I2C_STOP_US (RetailOS 0x22000588: 100 ms):
  * +0x20 bit13 (the ISR's test, 0x220013a6) or IICSTAT bit5 clear (the
- * polled wait 0x22000588 accepts that too); then IICCON &= ~0x2010 as the
- * ISR. Never done: the controller is initialised again, and after 4 such
- * STOPs in a row only one 1 ms try is made (older device runs never saw
- * STOP-done: 5 ms per STOP would eat the frame rate). */
+ * polled wait accepts that too); then IICCON &= ~0x2010, W1C and IICCON
+ * reread and written back, as the ISR. Never done: the controller is
+ * initialised again and the transfer FAILS (0). After 4 such STOPs in a
+ * row only one 1 ms try is made, so a dead STOP cannot stall Home polling
+ * for 100 ms a read (older device runs never saw STOP-done). */
 static unsigned stops_lost;
 static SMALL int stop_done(void) { return (I2C(0x20) & I2C_STOP_DONE) || !(I2C(0x04) & 0x20u); }
-static COLD void stop(unsigned mode) {
+static COLD int stop(unsigned mode) {
     unsigned n = stops_lost >= 4 ? 1 : I2C_STOP_US / 1000u, done = 0;
     I2C(0x20) = I2C_STOP_DONE;
     I2C(0x00) |= 0x2000u;
@@ -146,13 +149,13 @@ static COLD void stop(unsigned mode) {
         ++input_debug.to_stop;
         ++stops_lost;
         i2c_init();
-        return;
+        return 0;
     }
     stops_lost = 0;
-    uint32_t c = I2C(0x00) & ~0x2010u;
-    I2C(0x00) = c;
+    I2C(0x00) &= ~0x2010u;
     I2C(0x20) = I2C_BYTE_DONE | I2C_STOP_DONE;
-    I2C(0x00) = c;
+    I2C(0x00) = I2C(0x00);
+    return 1;
 }
 static uint32_t *start_log;
 static COLD int start(unsigned mode, unsigned addr) {
@@ -169,9 +172,10 @@ static COLD int start(unsigned mode, unsigned addr) {
     t0 = USEC;
     for (uint32_t polls = 0; I2C(0x10) && USEC - t0 < I2C_RDY_US && polls < I2C_RDY_US * 64u; ++polls) ;
     if (I2C(0x10)) ++input_debug.to_rdy;
-    /* no stale byte-done, and IICCON bit4 (pending: holds SCL) clear */
-    I2C(0x20) = I2C_BYTE_DONE;
-    I2C(0x00) = (I2C(0x00) & ~0x10u) | 0x180u;
+    /* no stale events; IICCON 0x181 as RetailOS's START (0x22000652):
+     * bit4 (pending: holds SCL) clear, STOP-done (bit13) not enabled */
+    I2C(0x20) = I2C_BYTE_DONE | I2C_STOP_DONE;
+    I2C(0x00) = 0x181u;
     I2C(0x04) = mode;
     I2C(0x0c) = addr;
     I2C(0x04) = mode | 0x20;
@@ -183,7 +187,7 @@ static COLD int start(unsigned mode, unsigned addr) {
     return ok;
 }
 /* START, address, then each byte; STOP in every case. 0, or the failed
- * stage (1 address, 2 data). */
+ * stage (1 address, 2 data, 5 STOP never done). */
 static COLD unsigned pmu_send(const uint8_t *bytes, unsigned n) {
     unsigned stage = start(0xd0, 0xe6) ? 0 : 1;
     for (unsigned i = 0; !stage && i < n; ++i) {
@@ -193,7 +197,7 @@ static COLD unsigned pmu_send(const uint8_t *bytes, unsigned n) {
         if (!byte_done() || (i + 1 < n && !acked())) stage = 2;
     }
     if (stage) failed(stage);
-    stop(0xd0);
+    if (!stop(0xd0) && !stage) failed(stage = 5);
     return stage;
 }
 static SMALL unsigned pmu_write(const uint8_t *bytes, unsigned n) {
@@ -201,7 +205,7 @@ static SMALL unsigned pmu_write(const uint8_t *bytes, unsigned n) {
     return pmu_send(bytes, n);
 }
 /* register pointer write + STOP, then a 1-byte read; -1 if any stage failed (stages 3 read
- * address, 4 read data) */
+ * address, 4 read data, 6 its STOP never done) */
 static COLD int pmu_read_once(unsigned reg) {
     uint8_t r = (uint8_t)reg;
     int result = -1;
@@ -213,7 +217,7 @@ static COLD int pmu_read_once(unsigned reg) {
             if (byte_done()) result = I2C(0x0c) & 0xff;
             else failed(4);
         } else failed(3);
-        stop(0x90);
+        if (!stop(0x90) && result >= 0) { failed(6); result = -1; }
     }
     return result;
 }
@@ -290,22 +294,41 @@ static unsigned sample(void) {
 /* I2C1 controller unstick (2026-10-17, AGY rank 3). The handoff can stop
  * RetailOS's interrupt-driven transfer (ISR 0x22001214) mid-byte: the
  * controller is left busy (IICSTAT bit5) or pending (IICCON bit4, SCL
- * held), a PMU mid-read may hold SDA. The pads are dedicated, so the
- * controller itself clocks: in master RX the pending byte is NACKed (the
- * slave lets SDA go after it), then a STOP (re-issued), then the init.
+ * held), a PMU mid-read may hold SDA. Round 10b, RetailOS's clear
+ * 0x220011ec first: +0x20 = 0x3f00 (W1C every event bit), IICCON reread
+ * and written back with bit4 clear. Still busy: the pads are dedicated,
+ * so the controller itself clocks: in master RX the byte is NACKed (the
+ * slave lets SDA go after it), then a STOP in a valid mode (IICSTAT &
+ * 0xc0 | 0x10 in a master mode, else master RX 0x90; re-issued), then
+ * the init. bt.c i2c_open uses this too.
  * The first run (boot, before any other PMU transfer) logs into
- * input_i2c_log (R84 v4 "ib", status and value kept apart):
+ * input_i2c_log (R84 v5 "ib", status and value kept apart):
  *   0-2   CLKCON +14 +4c +6c as found
  *   3-11  I2C1 +00 +04 +08 +0c +10 +14 +18 +20 +28 as found, clock on
- *   12    what was done: bit0 busy/pending found, bit1 RX byte NACKed
- *         (bit2: its byte-done came), bit3 STOP lost | to_stop << 8
+ *   12    what was done: bit0 busy/pending found, bit4 still busy after
+ *         the clear, bit1 RX byte NACKed (bit2: its byte done came), bit3
+ *         STOP lost | to_stop << 8
  *   13-15 I2C1 +00 +04 +20 after the init
  *   16    first START: IICSTAT | +20 << 8 | +10 << 24
  *   17-21 PMU reg 07 (Home, 8 tries), 00, 4b, 52, 56: status (0 ok, else
  *         the failed stage) | value << 8 (0xff with status != 0 = none)
+ *   22-28 round 10, right after the VIC IRQ 22 enable (input_i2c_vic):
+ *         VIC +00 +08 +10, I2C1 +00 +04 +20 +10
  * Later runs (Drivers entry, 4 failed Home polls, at most 1/s) only count
  * (input_debug.recs). Returns the done bits. */
 uint32_t input_i2c_log[INPUT_I2C_LOG];
+/* Round 10: RetailOS binds and enables I2C1's IRQ 22 at boot (0x08000218,
+ * 0x080014fe: VIC bank 0 +0x10, write-one-to-set) and leaves it on for its
+ * polled path too; NanoOS's VIC had it off. Enabled here before the first
+ * PMU transfer; CPSR I/F stay masked and no handler is installed. lg (if
+ * set): VIC +00 +08 +10, I2C1 +00 +04 +20 +10 right after. bt.c too. */
+COLD void input_i2c_vic(uint32_t *lg) {
+    static const uint32_t at[7] = {0x38e00000u, 0x38e00008u, 0x38e00010u, 0x3c900000u,
+                                   0x3c900004u, 0x3c900020u, 0x3c900010u};
+    *(volatile uint32_t *)0x38e00010u = 0x00400000u;
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (lg) for (unsigned i = 0; i < 7; ++i) lg[i] = *(volatile uint32_t *)at[i];
+}
 COLD uint32_t input_i2c_recover(void) {
     static const uint8_t regs[9] = {0, 4, 8, 0xc, 0x10, 0x14, 0x18, 0x20, 0x28};
     static int logged;
@@ -313,18 +336,21 @@ COLD uint32_t input_i2c_recover(void) {
     if (lg) { lg[0] = CLKCON(0x14); lg[1] = CLKCON(0x4c); lg[2] = CLKCON(0x6c); }
     i2c_ungate();
     if (lg) for (unsigned i = 0; i < 9; ++i) lg[3 + i] = I2C(regs[i]);
+    input_i2c_vic(lg ? &lg[22] : 0);
     unsigned to = input_debug.to_stop, st = I2C(0x04);
-    if ((st & 0x20u) || (I2C(0x00) & 0x10u)) {
-        did = 1;
+    if ((st & 0x20u) || (I2C(0x00) & 0x10u)) did = 1;
+    I2C(0x20) = 0x3f00u;
+    I2C(0x00) = I2C(0x00) & ~0x10u;
+    if ((st = I2C(0x04)) & 0x20u) {
+        did |= 0x10;
         if ((st & 0xc0u) == 0x80u) {    /* master RX: NACK the byte */
             did |= 2;
             resume_ack(0);
-            uint32_t t0 = USEC, spins = 0;
-            while (!(I2C(0x20) & I2C_BYTE_DONE) && USEC - t0 < I2C_BYTE_US &&
-                   ++spins < I2C_BYTE_US * 64u) ;
-            if (I2C(0x20) & I2C_BYTE_DONE) did |= 4;
+            if (byte_done()) did |= 4;
         }
-        stop((st & 0xc0u) | 0x10u);
+        /* a master mode's own STOP mode; busy in a slave mode (IICSTAT
+         * 0x20, 0x60): master RX 0x90, never 0x10/0x50 (fix14) */
+        stop(st & 0x80u ? (st & 0xc0u) | 0x10u : 0x90u);
         if (input_debug.to_stop != to) did |= 8;
     }
     i2c_init();

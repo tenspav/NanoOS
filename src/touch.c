@@ -34,6 +34,11 @@
  *    reset, only in the power-on). Polls here wait for ATN low, plus one
  *    unconditional query every 128 polls (~1 s) in case the level reads
  *    wrong; the IRQ itself stays off (VIC masked by the chainloader).
+ *    Round 12 (device: "TOUCH OK n 0", no reports since the MMU/D-cache
+ *    went on): touch_fast queries every 8 ms poll whatever ATN says
+ *    (else every 16th, ViceNano), the blind budget is per touch_start(),
+ *    the touch port has CS setup/hold/high delays (spi.h) and the fetch
+ *    waits TOUCH_GAP_US after the query.
  *  - Clock: gate 0x1e (CLKCON +0x4c bit 15, +0x6c bit 15) is port 2's
  *    (0x08010cb2), left on by RetailOS; cleared again here. Round 1's
  *    "gate 0x1c" is a device-power request id (0x08426e80), not this port.
@@ -63,7 +68,10 @@
 #define FETCH_MAX 64u
 #define TRIES 5u               /* RetailOS: 5, 1 ms apart */
 #define BLIND_L 0x36u          /* L of the report in snap6's RX buffer */
-#define BLIND_MAX 3u
+#define BLIND_MAX 3u            /* per touch_start() (round 12) */
+#ifndef TOUCH_GAP_US
+#define TOUCH_GAP_US 200u      /* round 12: query -> fetch gap, tune on hardware */
+#endif
 #define CAPTURE_US 3000000u    /* "touch the screen now" window on entry */
 #define CLK(o) (*(volatile uint32_t *)(0x3c500000u + (o)))
 #define SPI(o) (*(volatile uint32_t *)(SPI_TOUCH + (o)))
@@ -74,7 +82,8 @@
 struct touch_state touch;
 uint32_t touch_extra[TOUCH_EXTRA];
 static uint32_t last, ctrl0;
-static unsigned idle, force;
+static unsigned idle, force, blind_left;
+unsigned touch_fast = 1;
 /* R84 "ct" counters: query timeout, all-zero reply, L 0 with a header,
  * bad sum, bad L, fetch timeout, bad fetch, report, ATN-low polls, ATN-low
  * polls answered idle, blind fetches (ATN low but L 0: fetch BLIND_L
@@ -85,6 +94,7 @@ static uint32_t cnt[C_N];
 /* raw bytes, 4 per word, first byte on top: last query reply with L != 0,
  * last failed reply, last fetch reply (bytes 0-31) */
 static uint32_t raw_q[4], raw_bad[4], raw_f[8];
+static uint32_t lastq;      /* last query reply: rx[0] | L << 8 */
 static void pack(uint32_t *d, const uint8_t *s, unsigned n) {
     for (unsigned i = 0; i < n; ++i) d[i >> 2] = d[i >> 2] << 8 | s[i];
 }
@@ -109,15 +119,17 @@ static int read_once(unsigned blind) {
     ++cnt[C_QUERY];
     if (!xfer(tx, rx, 16)) goto err;
     c = C_SUM;
+    l = rx[1] | rx[2] << 8;
+    lastq = rx[0] | l << 8;
     unsigned s = sum(rx, 14);
     if ((s & 0xffff) != (unsigned)(rx[14] | rx[15] << 8)) goto err;
-    l = rx[1] | rx[2] << 8;
     if (l) pack(raw_q, rx, 16);
-    else if (blind && cnt[C_BLIND] < BLIND_MAX) { ++cnt[C_BLIND]; l = BLIND_L; }
+    else if (blind && blind_left) { --blind_left; ++cnt[C_BLIND]; l = BLIND_L; }
     else { ++cnt[s ? C_IDLE : C_ZERO]; return 0; }   /* nothing waits */
     c = C_LEN;
     if (l + 5 > FETCH_MAX || l < 0x1a) goto err;
     c = C_FTO;
+    delay_us(TOUCH_GAP_US);
     tx[2] = 0x01;
     tx[14] = 0;
     tx[l + 3] = 0xec;
@@ -215,7 +227,7 @@ void touch_report(void) {
     uint32_t v[NREGS > 6 ? NREGS : 6];
     fmt_out = p0;
     fmt_end = p0 + 4096;
-    fmt_str("== TOUCH R84 v4 =="); fmt_line(0, 0, 0);
+    fmt_str("== TOUCH R84 v5 =="); fmt_line(0, 0, 0);
     v[0] = touch.diag; v[1] = touch.bad; v[2] = touch.reports; v[3] = touch.errors;
     v[4] = spi_timeouts; v[5] = ctrl0;
     group("st ", v, 6);
@@ -247,6 +259,8 @@ void touch_start(void) {
     CLK(0x4c) &= ~0x8000u;              /* gate 0x1e on */
     CLK(0x6c) &= ~0x8000u;
     __asm__ volatile("dsb sy" ::: "memory");
+    idle = 0;
+    blind_left = BLIND_MAX;
     do r = read_one(0); while (r > 0 && ++n < 40);
     touch.errors = r < 0;   /* a failed first query shows as ERR */
     touch.reports = 0;
@@ -270,11 +284,40 @@ int touch_poll(void) {
     uint32_t hi = READY & 0x40;
     touch.diag = (touch.diag & ~0x10u) | hi >> 2;
     if (!hi) { touch.diag += 1u << 16; ++cnt[C_ATN]; }  /* ATN low: a report waits */
-    else if (!force && (++idle & 15)) return 0;
+    else if (!force && !touch_fast && (++idle & 15)) return 0;
     int r = read_one(!hi);
     if (!hi && !r) ++cnt[C_ATNIDLE];
     /* R84 again at 1, 2, 4, 8.. reports or errors */
     unsigned n = r > 0 ? touch.reports : r < 0 ? ++touch.errors : 3;
     if (TOUCH_DIAG && !force && !(n & (n - 1))) touch_report();
     return r > 0;
+}
+/* Round 12, Drivers page (drivers.c): the counters since boot, the last
+ * query reply (L, byte 0) and the raw contact state. The font has no q or
+ * z: rd = queries, at = ATN-low polls, zr = all-zero replies, id = idle
+ * with a header, ok = reports, bl = blind fetches, to = query/fetch
+ * timeouts, bad = bad sum/L/fetch. Round 12b: counts saturate (9999+,
+ * errors 999+) so each line is at most 51 characters at any value (53 fit
+ * from x 8):
+ *   "  rd 9999+ at 9999+ zr 9999+ id 9999+ L0000 bEA s05"           51
+ *   "  ok 9999+ bl 999+ to 999+/999+ bad 999+/999+/999+"            50 */
+static void sat(uint32_t v, uint32_t cap) {
+    fmt_dec(v > cap ? cap : v);
+    if (v > cap) fmt_str("+");
+}
+int touch_lines(int x, int y, int dy) {
+    static const char tag[][5] = {" rd ", " at ", " zr ", " id "};
+    static const uint8_t ix[] = {C_QUERY, C_ATN, C_ZERO, C_IDLE};
+    fmt_str(" ");
+    for (unsigned i = 0; i < sizeof ix; ++i) { fmt_str(tag[i]); sat(cnt[ix[i]], 9999); }
+    fmt_str(" L"); fmt_hex(lastq >> 8, 4); fmt_str(" b"); fmt_hex(lastq & 0xff, 2);
+    fmt_str(" s"); fmt_hex(touch.state, 2);
+    fmt_line(x, y, WHITE);
+    fmt_str("  ok "); sat(cnt[C_OK], 9999);
+    fmt_str(" bl "); sat(cnt[C_BLIND], 999);
+    fmt_str(" to "); sat(cnt[C_QTO], 999); fmt_str("/"); sat(cnt[C_FTO], 999);
+    fmt_str(" bad "); sat(cnt[C_SUM], 999); fmt_str("/"); sat(cnt[C_LEN], 999);
+    fmt_str("/"); sat(cnt[C_FBAD], 999);
+    fmt_line(x, y + dy, WHITE);
+    return y + 2 * dy;
 }

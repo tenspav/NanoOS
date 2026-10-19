@@ -79,6 +79,7 @@ def patch_launcher_source(main_c_path: Path, out_c_path: Path, include_drivers_p
         src = re.sub(r"^.*btui_tick\(keys, tap\);\n", "", src, flags=re.M)
         src = src.replace("else if (scene == SETTINGS) btui_enter();", "")
         src = re.sub(r"^.*unsigned drivers_page = 0;[^\n]*\n", "", src, flags=re.M)
+        src = re.sub(r"^.*mbx_test_leave\(\);\n", "", src, flags=re.M)
         src = src.replace("scene = 0; drivers_page = 0;", "scene = 0;")
         start = src.find("else if (scene == DEVMODE) {")
         if start >= 0:
@@ -173,10 +174,20 @@ def build_kernel_variant(cross: str, variant: str, include_drivers_page: bool) -
         # round 8: font8x8 glyphs 32..127 only (lcd.h), 256 B
         "-DNANOOS_FONT32",
     ]
+    # CPU MMU + D-cache (src/mmu.c): NANOOS_MMU=0 builds the MMU-off fallback
+    if os.environ.get("NANOOS_MMU") == "0":
+        cflags.append("-DNANOOS_MMU=0")
+        print("==> NANOOS_MMU=0: MMU and D-cache stay off (fallback kernel)")
     # Raw NAND write skeleton (nanoos/src/nand.c): off unless asked for.
     if os.environ.get("NANOOS_NAND_WRITE") == "1":
         cflags.append("-DNANOOS_NAND_WRITE=1")
         print("==> WARNING: NANOOS_NAND_WRITE=1: guarded NAND write path compiled in")
+    # round 11 size: the DevMode GPU page's diagnostic pages, 32 MB scans and
+    # R50..R53 report (mbx_test.c) are out of the shipping build; the frame
+    # render of each case stays
+    if os.environ.get("NANOOS_MBX_DIAG") == "1":
+        cflags.append("-DMBX_DIAG_PAGES=1")
+        print("==> NANOOS_MBX_DIAG=1: MBX diagnostic pages compiled in (kernel.bin may not fit)")
     cxxflags = cflags + [
         "-mthumb",
         # ViceNano float math on the VFPv4-D16 (startup.s enables it);
@@ -198,13 +209,14 @@ def build_kernel_variant(cross: str, variant: str, include_drivers_page: bool) -
     # round 6 size diet: cold modules without their own "Os" pragma (text
     # formatting, asset lookup, heap, reset) and the launcher build -Os in
     # the full kernel too (-O2 cost ~700 B of the 64 KiB for no speed need)
-    cold_os_stems = {"mbx", "mbx_test", "fmt", "asset", "mem", "reset"}
+    # mmu/game: once per boot or per launch
+    cold_os_stems = {"mbx", "mbx_test", "fmt", "asset", "mem", "reset", "mmu", "game"}
     if include_drivers_page:
         driver_sources = sorted(
             p for p in (NANOOS_DIR / "src").glob("*.c") if p.name != "main.c"
         )
     else:
-        slim_stems = {"lcd", "font", "input", "reset", "devmode", "mem", "timer", "fmt", "mbx", "asset", "clk"}
+        slim_stems = {"lcd", "font", "input", "reset", "devmode", "mem", "timer", "fmt", "mbx", "asset", "clk", "mmu", "game"}
         # DevMode shows the touch diag since the touch rework (touch.c + its SPI)
         if "touch." in (NANOOS_DIR / "src/devmode.c").read_text():
             slim_stems |= {"touch", "spi"}

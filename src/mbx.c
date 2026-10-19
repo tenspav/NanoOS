@@ -1,5 +1,6 @@
 #include "mbx.h"
 #include "timer.h"
+#include "memmap.h"
 /* RetailOS ordinary path: TA setup, EOL, selector, ISP pairs, +680 kick.
  * PTE attributes and the complete hardware PB allocator remain unproven;
  * PTEs try an ARM-style small-page type with the existing linear mapping.
@@ -77,13 +78,14 @@ static void trk(uint32_t st) {
  * 20 ms; +4 when it hit the EOL word), raw +0x12c, us since mbx_begin. */
 static uint32_t fail_reason, fail_status, fail_us;
 static uint32_t background;
-/* Both allocations live below the linker's 2 MB kernel/stack bound, hence
- * inside the first 32 MB of DRAM mapped by these eight page tables. */
-static uint32_t pt[8 * 1024] __attribute__((aligned(4096)));
+/* The GPU-visible buffers (tables, PB, parameter pool and workspace) are in
+ * the uncached kernel .dma (memmap.h MM_DMA), inside the first 32 MB of
+ * DRAM mapped by these eight page tables. */
+static uint32_t pt[8 * 1024] MM_DMA_BUF __attribute__((aligned(4096)));
 /* Reserve more than the observed pointer span, independently of grid size.
  * The scene/region area is embedded in this owned PB allocation. The traced
  * +0x1004 offset is known; allocator sizes/free-list seeds are not. */
-static uint32_t pb[PB_BYTES / 4] __attribute__((aligned(4096)));
+static uint32_t pb[PB_BYTES / 4] MM_DMA_BUF __attribute__((aligned(4096)));
 #define SCENE_VA MBX_VA((uint8_t *)pb + SCENE_OFFSET)
 static void barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
 /* RetailOS-style global parameter allocator storage (63 pages as RetailOS's
@@ -95,8 +97,8 @@ static void barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
 /* MBX_V_POOL: 256 pages; one guard page past the exclusive end */
 #define PARAM_MAX 256u
 #define PARAM_WORDS ((PARAM_MAX + 2u) * 1024u)
-static uint32_t mbx_param[PARAM_WORDS] __attribute__((aligned(4096)));
-static uint32_t mbx_param_aux[0x4000u / 4u] __attribute__((aligned(4096)));
+static uint32_t mbx_param[PARAM_WORDS] MM_DMA_BUF __attribute__((aligned(4096)));
+static uint32_t mbx_param_aux[0x4000u / 4u] MM_DMA_BUF __attribute__((aligned(4096)));
 static void barrier(void);
 static uint32_t nonzero(const uint32_t *p, uint32_t words) {
     uint32_t n = 0;
@@ -285,6 +287,10 @@ static void reset(uint32_t us, uint32_t passes) {
         barrier();
         delay_us(us);
     }
+}
+void mbx_halt(void) {
+    reset(500u, 16u);
+    CORE(0x134) = 0xffffu;
 }
 static void capture_diag(void) {
     static const uint32_t addr[11] = {

@@ -13,7 +13,14 @@
  * R50..R52 run the same sequence), or replaying scene 1.
  * Around the frame every 4 KB page of the GPU's 32 MB window is summed
  * before and after to find where the GPU wrote. Results cycle through ten
- * pages, then the raw aux dump (see the round-3/4 build reports). */
+ * pages, then the raw aux dump (see the round-3/4 build reports).
+ * Round 11 (size): those pages, the two scans and the R50..R53 report are
+ * MBX_DIAG_PAGES only (-DMBX_DIAG_PAGES=1; build_payload.py: environment
+ * NANOOS_MBX_DIAG=1). Without it (the shipping build) the page renders the
+ * same frame of the same case and shows it with one status line. */
+#ifndef MBX_DIAG_PAGES
+#define MBX_DIAG_PAGES 0
+#endif
 #define W 240            /* portrait render target */
 #define H 432
 #define LW LCD_WIDTH     /* landscape LCD, 432x240 */
@@ -155,10 +162,14 @@ static const uint32_t *const seg_src[7] = { s0, s1, s2, s3, &tri.hdr, d1, mbx_pr
 static const uint16_t seg_len[7] = { 20, 20, 17, 381, sizeof tri / 4, 394, 210 };
 static const uint8_t seg_ck[7] = { MBX_CK_S0, MBX_CK_S1, MBX_CK_S2, MBX_CK_S3, MBX_CK_TRI,
                                    MBX_CK_S3, MBX_CK_PFX };
+#if MBX_DIAG_PAGES
 static const uint32_t seg_crc[7] = { 0x9439e7ddu, 0x0c911ea3u, 0x56162c96u, 0x361a9d19u, 0,
                                      0x43677d63u, 0x59d21f20u };
+#endif
+#if MBX_DIAG_PAGES
 static const char st[3][2] = { "A", "T", "I" };   /* aux stages */
 static const char seg_name[7][3] = { "S0", "S1", "S2", "S3", "TR", "D1", "P" };
+#endif
 #define NVAR 4u
 #define R5 (G_S0 | G_S1 | G_S2 | G_TRI)
 #define R5F (MBX_V_85C | MBX_V_NOBELL | MBX_V_CTX)
@@ -172,6 +183,7 @@ static const struct { uint8_t id, segs; uint16_t flags; char desc[24]; } var[NVA
  * outside the kalloc heap, inside the GPU's 32 MB. The trace ring
  * (trace.h) shares its first 8 KB, so it is refilled just before the frame. */
 #define target ((uint32_t *)0x08300000u)
+#if MBX_DIAG_PAGES
 #define SCAN_BASE 0x08000000u
 #define SCAN_PAGES 8192u
 extern uint8_t __data_start[], _stack_top[];
@@ -183,8 +195,11 @@ extern uint8_t __data_start[], _stack_top[];
 #define AUXW 4096u
 /* page sums; after the second scan, scratch for sorting the aux copy */
 static uint32_t sums[SCAN_PAGES];
-static uint32_t variant, pending = 1, t_done;
+#endif
+static uint32_t variant, pending, t_done;   /* pending: set by mbx_test_enter (fix14 size: .bss) */
 static int ok, rc;
+static uint32_t page_no, page_total;
+#if MBX_DIAG_PAGES
 /* tgt (after the ISP): changed words, magenta words, first changed
  * index/value, bounding box of changed words, changed words inside/outside
  * the tile, tile words == 0x00bdd6ff, raw first two tile rows;
@@ -204,7 +219,7 @@ static uint32_t s_idx[MBX_SEGS], s_crc[MBX_SEGS], s_wcrc[MBX_SEGS];
 #define RAW_LINES 20u
 #define RAW_PAGE (4u * RAW_LINES)
 #define RAW_PER 52u      /* pages of RAW_PAGE words per aux copy */
-static uint32_t raw_stage[3], n_stage, page_no, page_total;
+static uint32_t raw_stage[3], n_stage;
 static const char ev_site[8][4] = { "rst", "ack", "824", "828", "82c", "838", "83c", "6d8" };
 static const char lbl[52][4] = {
     "rst", "ack", "@24", "@28", "@2c", "@38", "@3c", "@d8",
@@ -217,6 +232,7 @@ static const char rb_lbl[15][4] = { "824", "828", "82c", "838", "83c", "6d8", "8
     "840", "844", "84c", "850", "854", "858", "860", "020" };
 static const char ck_lbl[MBX_CK_N][7] = { "reset", "A", "CTX", "PFX", "WAKE", "B", "post8", "S0",
     "S1", "S2", "S3/D1", "TRI", "preEOL", "EOL", "T", "I" };
+#endif
 static void head(int y) {
     fmt_str("R"); fmt_dec(var[variant].id); fmt_str(" "); fmt_str(var[variant].desc);
     if (page_total) { fmt_str(" p"); fmt_dec(page_no + 1); fmt_str("/"); fmt_dec(page_total); }
@@ -230,6 +246,7 @@ static void busy(const char *what, uint32_t pct) {
     fmt_line(4, 24, WHITE);
     lcd_flush();
 }
+#if MBX_DIAG_PAGES
 static uint32_t page_sum(uint32_t p) {
     const volatile uint32_t *w = (const volatile uint32_t *)(SCAN_BASE + (p << 12));
     uint32_t s = 0;
@@ -321,39 +338,53 @@ static void aux_stats(void) {
         i = e;
     }
 }
+#endif
 static void run(void) {
     uint32_t f = var[variant].flags, *d = (uint32_t *)&mbx_dbg;
     for (uint32_t i = 0; i < sizeof mbx_dbg / 4; ++i) d[i] = 0;
+#if MBX_DIAG_PAGES
     tgt_chg = tgt_mag = t_in = t_out = t_bdd = n_gpu = n_cpu = 0;
     tgt_idx = MBX_NONE;
     bx0 = W; by0 = H; bx1 = by1 = 0;
     for (uint32_t i = 0; i < 16; ++i) raw[i] = 0;
+#endif
     mbx.scenes = mbx.jobs = mbx.timeouts = 0;
     busy("init", 0);
     d1_build();
     mbx_variant = f | MBX_V_DIAG;
     ok = mbx_init();
     rc = -1;
+#if MBX_DIAG_PAGES
     uint32_t n = 0;
+#endif
     if (ok) {
+#if MBX_DIAG_PAGES
         scan(0);
+#endif
         for (int i = 0; i < W * H; ++i) target[i] = 0xff00ff00u;
         __asm__ volatile("dsb sy" ::: "memory");
         mbx_set_background(0xffff00ffu);
         mbx_set_target(target, W, H, W);
+#if MBX_DIAG_PAGES
         s_idx[n++] = SEG_P;
+#endif
         mbx_begin();
         for (uint32_t i = 0; i < 6; ++i)
             if (var[variant].segs & 1u << i) {
+#if MBX_DIAG_PAGES
                 if (n < MBX_SEGS) s_idx[n++] = i;
+#endif
                 mbx_submit_seg(seg_src[i], seg_len[i], seg_ck[i]);
             }
         rc = mbx_render(target, W, H, W) | mbx_wait_done(50000);
         __asm__ volatile("dsb sy" ::: "memory");
+#if MBX_DIAG_PAGES
         snap_target();
         scan(1);
+#endif
     }
     mbx_variant = 0;
+#if MBX_DIAG_PAGES
     busy("stats", 0);
     if (mbx_dbg.ran & 1u) aux_stats();
     n_stage = 0;
@@ -377,14 +408,30 @@ static void run(void) {
         s_crc[s] = mbx_crc32(seg_src[s_idx[s]], seg_len[s_idx[s]]);
         s_wcrc[s] = mbx_crc32(log + o, w);
     }
+#endif
     pending = 0;
     t_done = USEC;
 }
 void mbx_test_enter(void) { pending = 1; }
+/* Round 10: Home from the GPU page (its only exit: Vol+/- pick the case).
+ * Round 10b: the core is always reset (mbx_halt: core_init's 16-pass
+ * reset loop + event ack), not only after a failed scene, so no TA/ISP
+ * work can outlive the page; the next GPU user runs mbx_init() as always. */
+void mbx_test_leave(void) { mbx_halt(); }
 void mbx_test_key(unsigned keys) {
     if (keys & BUTTON_RIGHT) { variant = variant + 1 == NVAR ? 0 : variant + 1; pending = 1; }
     if (keys & BUTTON_LEFT) { variant = variant ? variant - 1 : NVAR - 1; pending = 1; }
 }
+static void image(void) {
+    /* portrait (px,py) -> landscape (431-py, px) */
+    for (int py = 0; py < H; ++py)
+        for (int px = 0; px < W; ++px) lcd_pixel(LW - 1 - py, px, target[py * W + px]);
+}
+static void plain(void) {
+    image();
+    head(2);
+}
+#if MBX_DIAG_PAGES
 static void pair(uint32_t a, uint32_t b) { fmt_dec(a); fmt_str("/"); fmt_dec(b); }
 static void at(uint32_t i) { if (i == MBX_NONE) fmt_str("NONE"); else fmt_dec(i); }
 static void at_val(uint32_t i, uint32_t v) {
@@ -402,11 +449,6 @@ static void dec4(uint32_t v) {
 static int ran(uint32_t k) { return mbx_dbg.ran >> k & 1u; }
 static void stage_dec(uint32_t k, uint32_t v) { if (ran(k)) fmt_dec(v); else fmt_str("NR"); }
 static int line(int y) { fmt_line(4, y, WHITE); return y + 10; }
-static void image(void) {
-    /* portrait (px,py) -> landscape (431-py, px) */
-    for (int py = 0; py < H; ++py)
-        for (int px = 0; px < W; ++px) lcd_pixel(LW - 1 - py, px, target[py * W + px]);
-}
 static void aux_line(uint32_t k, int y) {
     fmt_str(k ? "auxI " : "auxT ");
     if (!ran(2 + k)) fmt_str("NOT_RUN");
@@ -480,10 +522,6 @@ static void summary(void) {
     fmt_str(" gap "); stage_dec(2, mbx_dbg.tbl_gap[0]); fmt_str("/"); stage_dec(3, mbx_dbg.tbl_gap[1]);
     fmt_str(" fifomax "); fmt_dec(mbx_dbg.fifo_max); fmt_str(" bells "); fmt_dec(mbx_dbg.bells);
     line(102);
-}
-static void plain(void) {
-    image();
-    head(2);
 }
 /* registers, readbacks at B/T/I, scan pages */
 static void dump(void) {
@@ -791,7 +829,9 @@ static void rpt_save(void) {
     h->magic[1] = RPT_MAGIC1;
     h->hdr_sum = rpt_hdr_sum();
 }
+#endif
 void mbx_test_draw(void) {
+#if MBX_DIAG_PAGES
     if (pending) { run(); rpt_save(); }
     /* ten pages of ~4.2 s, then the raw aux pages of ~2.1 s each */
     uint32_t cycle = (NPAGES << 22) + ((n_stage * RAW_PER) << 21);
@@ -815,5 +855,13 @@ void mbx_test_draw(void) {
     fmt_str(rpt_len < RPT_SLOT_SIZE ? "RPT SAVED R" : "RPT TRUNC R"); fmt_dec(var[variant].id);
     fmt_str(" "); fmt_dec(rpt_len); fmt_str("B  Vol+/-: case  Home: back");
     fmt_line(4, 226, WHITE);
+#else
+    if (pending) run();
+    plain();
+    fmt_str(!ok ? "NO GPU" : rc ? "ERR" : "OK"); fmt_str(" ta "); fmt_hex(mbx.ta_status, 8);
+    fmt_str(" job "); fmt_hex(mbx.job_status, 8); fmt_str(" to "); fmt_dec(mbx.timeouts);
+    fmt_str("  Vol+/-: case  Home: back");
+    fmt_line(4, 226, WHITE);
+#endif
     lcd_present();
 }

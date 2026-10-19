@@ -6,9 +6,10 @@
 .type _start,%function
 _start:
     cpsid aif
-    /* Instruction cache and branch prediction on (MMU and data cache stay
-     * off): with SCTLR.I clear every fetch went to uncached DRAM. Invalidate
-     * first, the chainloader may leave stale lines. */
+    /* Instruction cache and branch prediction on (MMU and data cache come
+     * on in kernel_main, mmu.c): with SCTLR.I clear every fetch went to
+     * uncached DRAM. Invalidate first, the chainloader may leave stale
+     * lines. */
     mov r0, #0
     mcr p15, 0, r0, c7, c5, 0       @ ICIALLU
     mcr p15, 0, r0, c7, c5, 6       @ BPIALL
@@ -74,11 +75,16 @@ _start:
     str r3, [r5]                    @ without a pack must not re-copy it
 5:  ldr r0, =__bss_start
     ldr r1, =__bss_end
-    mov r2, #0
-1:  cmp r0, r1
-    strlo r2, [r0], #4
-    blo 1b
+    bl 7f
+    ldr r0, =__dma_start            @ the DMA buffers (kernel.ld .dma)
+    ldr r1, =__dma_end
+    bl 7f
     bl kernel_main
 2:  wfi
     b 2b
+7:  mov r2, #0
+1:  cmp r0, r1
+    strlo r2, [r0], #4
+    blo 1b
+    bx lr
 .size _start, .-_start

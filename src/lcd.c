@@ -21,7 +21,7 @@
  * the current one is pushed. */
 #define BUF0 0x08200000u
 #define BUF1 0x08280000u    /* 0x65400 bytes each */
-static uint32_t *fb = (uint32_t *)BUF1;    /* drawing (back) buffer */
+static uint32_t *fb;    /* drawing (back) buffer; BUF1 from lcd_init (fix14 size: .bss) */
 #define FB_WORDS (LCD_PANEL_WIDTH * LCD_PANEL_HEIGHT)
 /* Scan-out window: format, stride, origin, size, then enable. Also used
  * to recover a controller that stopped answering (lcd_stats.recovered). */
@@ -97,12 +97,24 @@ void lcd_center(int y, const char *s, uint32_t c) {
  * hardware condition at a time, so input keeps being sampled while a frame
  * is in flight. Every wait has a deadline (NanoEmu does not model the
  * bridge; a stuck bit must not hang the kernel) and a poll-count backstop
- * for a frozen USEC; both are counted apart in lcd_stats. */
+ * for a frozen USEC; both are counted apart in lcd_stats.
+ *
+ * Round 10 (buffer ownership): +0x24 is changed and the old front buffer
+ * becomes the drawing buffer only once the bridge is idle (0x3830008c
+ * bits 0..1 clear): the device ends every push after BUSY_HOLD_US with
+ * the busy bits still up, and drawing used to start at once in the buffer
+ * that was still being sent. An expired wait no longer proceeds: the push
+ * is aborted (0x38300080 released, no 0x2c after a failed window packet,
+ * not counted as a frame) and the same front buffer is pushed again,
+ * after the bridge is idle, unless a newer frame is queued by then. A
+ * bridge that stays busy: the window is re-armed after RECOVER_AFTER
+ * failures in a row and the wait starts over (bounded, never blocking:
+ * every wait yields; lcd_flush is bounded by FLUSH_US). */
 struct lcd_stats lcd_stats;
 enum { IDLE, WAIT_IDLE = 2, WIN_COL, WIN_PAGE, MEMWRITE, BUSY_RISE,
        BUSY_FALL, SETTLE };         /* numbers as shown by DevMode "st" */
-static unsigned state = IDLE, dirty, polls;
-static unsigned expired_now, expired_run;  /* this push / pushes in a row */
+static unsigned state = IDLE, dirty, retry, polls;
+static unsigned expired_run;        /* failed waits in a row */
 #define RECOVER_AFTER 3u
 static uint32_t t0, flipped, sent;   /* sent: DCS 0x2c went out */
 #define SPIN_US 200u                /* poll in place this long, then yield */
@@ -128,63 +140,74 @@ static int check(volatile uint32_t *r, uint32_t mask, uint32_t want, int any,
     } while (USEC - start < SPIN_US);
     return 2;
 }
-/* an expired wait proceeds anyway, as the blocking version did */
-static COLD int expired(int r) {
-    if (r == WAIT_TIMEOUT) { ++lcd_stats.timeouts; lcd_stats.last = state; expired_now = 1; }
-    if (r == WAIT_SPIN) { ++lcd_stats.spins; lcd_stats.last = state; expired_now = 1; }
-    return r != 2;
-}
-static COLD void finish(void) {
-    trace(2);
+static COLD void release(void) {
     BRIDGE(0x80) = 0;
     __asm__ volatile("dsb sy" ::: "memory");
-    ++lcd_stats.frames;
-    lcd_stats.push_us = USEC - flipped;
-    lcd_stats.end_us = USEC - sent;
     state = IDLE;
-    /* Several pushes in a row with an expired wait: the controller may
-     * have lost its window setup (it is idempotent to write it again).
-     * The DSI side is not reset: RetailOS's link setup is not known. */
-    expired_run = expired_now ? expired_run + 1 : 0;
-    expired_now = 0;
-    if (expired_run >= RECOVER_AFTER) {
+}
+/* 1 = the condition came; 0 = poll again later, or the wait expired: then
+ * the push is aborted (counted, lcd_stats.last = its state) and retried
+ * from WAIT_IDLE. Several failures in a row: the controller may have lost
+ * its window setup (idempotent to write it again). The DSI side is not
+ * reset: RetailOS's link setup is not known. */
+static COLD int ok(int r) {
+    if (r == WAIT_OK) return 1;
+    if (r == 2) return 0;
+    if (r == WAIT_TIMEOUT) ++lcd_stats.timeouts; else ++lcd_stats.spins;
+    lcd_stats.last = state;
+    if (state != WAIT_IDLE) retry = 1;  /* the front buffer was not sent */
+    release();
+    if (++expired_run >= RECOVER_AFTER) {
         window();
         expired_run = 0;
         ++lcd_stats.recovered;
     }
+    return 0;
+}
+static COLD void finish(void) {
+    trace(2);
+    release();
+    ++lcd_stats.frames;
+    lcd_stats.push_us = USEC - flipped;
+    lcd_stats.end_us = USEC - sent;
+    expired_run = 0;
 }
 COLD void lcd_service(void) {
     for (;;) {
         switch (state) {
         case IDLE:
-            if (!dirty) return;
-            dirty = 0;
-            /* the drawn frame becomes the scan-out, drawing moves on */
-            __asm__ volatile("dsb sy" ::: "memory");
-            REG(0x24) = (uint32_t)fb;
-            fb = (uint32_t *)((uint32_t)fb == BUF0 ? BUF1 : BUF0);
-            flipped = lcd_stats.flipped = USEC; trace(1);
+            if (!dirty && !retry) return;
             enter(WAIT_IDLE);
             break;
-        case WAIT_IDLE:                     /* previous push done */
-            if (!expired(check(&BRIDGE(0x8c), 3, 0, 0, 50000))) return;
+        case WAIT_IDLE:                     /* previous push done, bridge idle */
+            if (!ok(check(&BRIDGE(0x8c), 3, 0, 0, 50000))) return;
+            if (dirty) {
+                /* the drawn frame becomes the scan-out, drawing moves on
+                 * to the old front buffer, sent and no longer read */
+                dirty = 0;
+                __asm__ volatile("dsb sy" ::: "memory");
+                REG(0x24) = (uint32_t)fb;
+                fb = (uint32_t *)((uint32_t)fb == BUF0 ? BUF1 : BUF0);
+                flipped = lcd_stats.flipped = USEC; trace(1);
+            }
+            retry = 0;
             BRIDGE(0x80) = 1;
             dsi_long(0x0000002a, 0xef);     /* columns 0..239 */
             enter(WIN_COL);
             break;
         case WIN_COL:                       /* FIFOs empty */
-            if (!expired(check(&DSI(0x44), 0x500000u, 0x500000u, 0, 50000))) return;
+            if (!ok(check(&DSI(0x44), 0x500000u, 0x500000u, 0, 50000))) return;
             dsi_long(0x0100002b, 0xaf);     /* pages 0..431 */
             enter(WIN_PAGE);
             break;
         case WIN_PAGE:
-            if (!expired(check(&DSI(0x44), 0x500000u, 0x500000u, 0, 50000))) return;
+            if (!ok(check(&DSI(0x44), 0x500000u, 0x500000u, 0, 50000))) return;
             DSI(0x34) = 0x2c05;             /* DCS short: memory write */
             sent = USEC;
             enter(MEMWRITE);
             break;
         case MEMWRITE:
-            if (!expired(check(&DSI(0x44), 0x400000u, 0x400000u, 0, 50000))) return;
+            if (!ok(check(&DSI(0x44), 0x400000u, 0x400000u, 0, 50000))) return;
             enter(BUSY_RISE);
             break;
         case BUSY_RISE: {
@@ -221,7 +244,7 @@ COLD void lcd_service(void) {
         }
     }
 }
-int lcd_busy(void) { return dirty || state != IDLE; }
+int lcd_busy(void) { return dirty || retry || state != IDLE; }
 int lcd_ready(void) { return !dirty; }
 uint32_t *lcd_back(void) { return fb; }
 void lcd_present(void) { dirty = 1; }

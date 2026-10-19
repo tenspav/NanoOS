@@ -1,6 +1,13 @@
 #ifndef NANOOS_BT_H
 #define NANOOS_BT_H
 #include <stdint.h>
+/* bt.phase (round 11): mask = Set_Event_Mask (step ssp); page =
+ * Create_Connection; key = authentication asked, link key request; io /
+ * confirm = SSP IO capability / user confirmation; auth = SSP done, waiting
+ * for Authentication_Complete; encrypt; ctrl / intr = the L2CAP channel
+ * being opened, ctrl cfg / intr cfg = being configured */
+enum { BT_PH_NONE, BT_PH_MASK, BT_PH_PAGE, BT_PH_KEY, BT_PH_IO, BT_PH_CONFIRM, BT_PH_AUTH,
+       BT_PH_ENCRYPT, BT_PH_CTRL, BT_PH_CTRL_CFG, BT_PH_INTR, BT_PH_INTR_CFG };
 enum { BT_OFF, BT_RESET, BT_PATCH, BT_VER, BT_SSP, BT_INQ, BT_CONNECT, BT_AUTH,
        BT_CTRL, BT_INTR, BT_HID, BT_ERR, BT_READY,
        BT_PMU /* only as bt.failed: power_up's PMU step failed, no HCI */ };
@@ -25,7 +32,8 @@ struct bt_pad { int8_t lx, ly; uint32_t buttons; };
 #define PAD_DOWN   0x08000u
 #define PAD_LEFT   0x10000u
 /* step: enum above; failed/status: the step that timed out or was refused
- * and why (0xff = timeout); retries: searches restarted after a failure
+ * and why (0xff = timeout, 0x1xx = L2CAP connection result xx, else the
+ * HCI status); retries: searches restarted after a failure
  * past bring-up; peer: the pad's BD_ADDR (wire order) */
 struct bt_state { unsigned step, failed, status; uint8_t peer[6];
                   uint16_t handle; uint32_t events, acl, reports, dropped, retries;
@@ -34,13 +42,21 @@ struct bt_state { unsigned step, failed, status; uint8_t peer[6];
                    * 0x56 0x4b before / after power-up (bt.c's own I2C
                    * reads), failed PMU attempts (transfer error or wrong
                    * read-back) and the stage of the last one (1 address
-                   * NACK, 2 data NACK, 3 no byte done), HCI Reset tries,
+                   * NACK, 2 data NACK, 3 no byte done; | 0x10 its STOP
+                   * never done: no more retries), HCI Reset tries,
                    * patchram (1 loaded, 2 skipped: RetailOS's copy in DRAM
                    * failed the checksum), raw bytes received; pmu_ok:
                    * bit 3k+i = pmu[k][i] is a byte read (else FF = failed) */
                   uint8_t have_ver, hci_ver, tries, patched;
                   uint16_t mfr, lmp_sub;
-                  uint8_t pmu[2][3], i2c_st, pmu_ok; uint32_t pmu_err, rxn; };
+                  uint8_t pmu[2][3], i2c_st, pmu_ok; uint32_t pmu_err, rxn;
+                  /* round 11: phase: where the step is (BT_PH_*, apart
+                   * from step; each new one restarts the step deadline);
+                   * fphase: the phase of the last failure | 0x80 (0 = none
+                   * shown: an explicit scan/connect clears it); again:
+                   * Central retries of the same target made (0..2);
+                   * waiting: one is scheduled (bt_service starts it) */
+                  uint8_t phase, fphase, again, waiting; };
 extern struct bt_state bt;
 void bt_start(void);     /* power up, HCI reset + version, then find the pad */
 void bt_service(void);   /* call every pass: RX, protocol steps, deadlines */
@@ -49,15 +65,18 @@ void bt_service(void);   /* call every pass: RX, protocol steps, deadlines */
  * zeroed) */
 int bt_pad_poll(struct bt_pad *p);
 const char *bt_step_name(unsigned step);
+const char *bt_phase_name(unsigned phase);   /* BT_PH_*: "" for none */
 /* Bluetooth Central (btui.c, Settings): manual mode. bt_power(1) brings
  * the controller up and scans; bt_scan lists every device answering an
  * inquiry (name from EIR, else a remote name request after it) instead of
  * taking the first gamepad; bt_connect pages one of them (the same HID
  * path: SSP Just Works, L2CAP 0x11/0x13, every pad format); a failure or
- * bt_disconnect ends in BT_READY, no search again. bt_power(0): link
+ * bt_disconnect ends in BT_READY, no search again (round 11: a timeout
+ * retries the same target twice, bt.again / bt.waiting). bt_power(0): link
  * dropped, PMU 0x4b = 0x09 (reset held, as RetailOS's BT off), BT_WAKE
  * low, UART1 clock gated. ViceNano's bt_pad_poll starts in the old
  * automatic mode. */
+/* name: the device name, else its address "AA:BB:..:FF" (round 11) */
 struct bt_dev { uint8_t addr[6], cod[3], named; char name[18]; };
 #define BT_DEVS 10
 extern struct bt_dev bt_devs[BT_DEVS];
@@ -66,6 +85,8 @@ void bt_power(int on);
 void bt_scan(void);
 void bt_connect(const uint8_t *addr);
 void bt_disconnect(void);
+/* round 11: the list's name of address a, else the address as text */
+const char *bt_name(const uint8_t *a);
 int bt_pad_state(struct bt_pad *p);   /* *p = the pad, 1 while connected */
 void bt_line(void);      /* the Drivers page line, into fmt's buffer */
 #endif

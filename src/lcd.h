@@ -19,20 +19,23 @@ void lcd_center(int y, const char *text, uint32_t color);
 uint32_t *lcd_back(void);
 void lcd_present(void);   /* marks the frame; lcd_service() pushes it */
 void lcd_service(void);   /* call every main-loop pass; never blocks long */
-int lcd_busy(void);       /* a frame is queued or in flight */
-int lcd_ready(void);      /* no frame queued: the next one may be drawn
-                           * (while the last one is still being pushed) */
+int lcd_busy(void);       /* a frame is queued, in flight or to be re-sent */
+int lcd_ready(void);      /* the back buffer is free: no frame queued, so
+                           * the next one may be drawn (while the last one
+                           * may still be in flight: the buffer it is sent
+                           * from is never the back buffer; scanout done =
+                           * !lcd_busy()) */
 void lcd_flush(void);     /* present and wait until it is on the glass
                            * (at most FLUSH_US) */
-/* completed pushes; expired waits by deadline / by poll backstop, the
- * state the last one expired in; pushes whose busy bits never rose; pushes
+/* completed pushes; expired waits by deadline / by poll backstop (each
+ * aborts its push, round 10), the state the last one expired in; pushes whose busy bits never rose; pushes
  * whose busy bits were still up after BUSY_HOLD_US (ended anyway) */
 struct lcd_stats { uint32_t frames, timeouts, spins, last, norise, held,
                    push_us, /* flip to end of the last push */
                    rise_us, end_us, /* 0x2c to busy seen / to the end */
                    flipped, /* USEC of the last flip */
                    recovered; /* window re-armed after RECOVER_AFTER
-                               * pushes in a row with an expired wait */ };
+                               * expired waits in a row */ };
 extern struct lcd_stats lcd_stats;
 /* NANOOS_FONT32 (the kernel build, build_payload.py): glyphs 32..127 only,
  * 256 B less; control characters draw as a space. NanoOSLoader links

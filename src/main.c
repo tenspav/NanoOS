@@ -10,13 +10,17 @@
 #include "fmt.h"
 #include "touch.h"
 #include "btui.h"
+#include "mmu.h"
+#include "game.h"
 void reset_stockos(void) __attribute__((noreturn));
-#define APPS 5
+#define APPS 6
 #define SETTINGS 3   /* Bluetooth Central (btui.c) */
 #define DEVMODE 4
-static const char *const names[APPS] = {"StockOS", "ViceNano", "PS1Emu", "Settings", "DevMode"};
-static const char *const labels[APPS] = {"iP", "VC", "P1", "ST", "DV"};
-static const uint32_t colors[APPS] = {0xff2684ff, 0xffff8800, 0xff28b848, 0xff808080, 0xffa04ce0};
+#define GAME 5       /* only when NanoOSLoader handed over a game.bin (game.c) */
+static const char *const names[APPS] = {"StockOS", "ViceNano", "PS1Emu", "Settings", "DevMode", "Game"};
+static const char *const labels[APPS] = {"iP", "VC", "P1", "ST", "DV", "GM"};
+static const uint32_t colors[APPS] = {0xff2684ff, 0xffff8800, 0xff28b848, 0xff808080, 0xffa04ce0, 0xffe0306c};
+static unsigned apps = APPS - 1;   /* + 1 with a game */
 #define BG 0xff1a1a1au
 #define GRAY 0xff808080u
 /* CPU: PLL-A retuned to a firmware-table rate, buses kept at or under
@@ -34,6 +38,14 @@ static const struct {
     {"MAX", 0x20000000u, 0xffd03838u, 532, 266},
 };
 static unsigned active_profile, selected;
+/* Round 10: a scene change draws only into a free back buffer: a queued
+ * frame is pushed first (lcd_service, bounded as lcd_flush). The back
+ * buffer is never the one being sent (lcd.c), so the timeout fallback
+ * only replaces a queued frame. Scene loops draw on lcd_ready() as before. */
+static void ready(void) {
+    uint32_t t0 = USEC;
+    for (uint32_t n = 0; !lcd_ready() && USEC - t0 < 200000u && n < 100000u; ++n) lcd_service();
+}
 static void rect(int x, int y, int w, int h, uint32_t c) {
     for (int j = 0; j < h; ++j)
         for (int i = 0; i < w; ++i) lcd_pixel(x + i, y + j, c);
@@ -49,6 +61,7 @@ static void text_k(int cx, int y, const char *s, int k, uint32_t c) {
 }
 #define BOX 144   /* selector: profile i is x in [i * BOX, (i + 1) * BOX) */
 static void clock_selector(unsigned selected) {
+    ready();
     lcd_clear(BG);
     lcd_center(16, NANOOS_TITLE, WHITE);
     lcd_center(56, "Choose clock profile", WHITE);
@@ -87,14 +100,14 @@ static int slide, drawn;   /* drawn: slide * 8 + selected on screen */
 static int anim;
 static uint32_t *bars[2];
 static void step(int dir) {
-    selected = (selected + APPS + dir) % APPS;
+    selected = (selected + apps + dir) % apps;
     slide += dir * SPACING;
 }
 static void launcher(unsigned selected) {
     static const signed char order[] = {-2, 2, -1, 1, 0};   /* centre on top */
-    uint32_t *b = lcd_back();
-    if (!anim) bars[0] = bars[1] = 0;
+    if (!anim) { ready(); bars[0] = bars[1] = 0; }
     anim = 0;
+    uint32_t *b = lcd_back();
     if (b == bars[0] || b == bars[1]) lcd_fill_rows(BAND_Y0, BAND_Y1, BG);
     else {
         bars[bars[0] != 0] = b;
@@ -113,7 +126,7 @@ static void launcher(unsigned selected) {
     for (unsigned n = 0; n < 5; ++n) {
         int k = order[n], x = CX + k * SPACING + slide;
         int d = x < CX ? CX - x : x - CX, r = 50 - d * 18 / SPACING;
-        unsigned i = (selected + APPS + k) % APPS;
+        unsigned i = (selected + apps + k) % apps;
         if (r < 8) r = 8;
         int s = (unsigned)r / 16;   /* label scale: 3 centred, 2 beside, far ones none */
         if (!k) lcd_circle(x, CY, r + 3, WHITE);
@@ -125,6 +138,7 @@ static void launcher(unsigned selected) {
     lcd_present();
 }
 static void placeholder(unsigned target) {
+    ready();
     lcd_clear(BG);
     lcd_center(100, names[target], WHITE);
     lcd_center(132, "tap or Home: back", WHITE);
@@ -142,7 +156,7 @@ static void placeholder(unsigned target) {
 static int touch_x0 = -1;   /* -1 no contact, -2 swipe sent */
 static unsigned gesture(void) {
     if (!touch_poll()) return 0;
-    int up = touch.state == TOUCH_UP, was = touch_x0;
+    int up = touch.state >= TOUCH_UP, was = touch_x0;   /* release: 5 and up */
     if (!up && (was == -1 || touch.state == TOUCH_DOWN)) { touch_x0 = touch.x; return 0; }
     if (up) touch_x0 = -1;
     if (was < 0) return 0;
@@ -155,6 +169,10 @@ void kernel_main(void) {
     unsigned scene = 0, profile = 0;
     unsigned choosing_clock = 1;
     unsigned drivers_page = 0;     /* DevMode: 0 stats, 1 drivers, 2 GPU */
+    /* first: the game chunks in high DRAM are only intact until NanoOS
+     * writes there (memmap.h) */
+    mmu_init();
+    apps += game_boot();
     lcd_init();
     input_init();
     touch_start();
@@ -170,6 +188,7 @@ void kernel_main(void) {
          * a tap on the launcher); in a scene a tap goes back like Home:
          * anywhere on a placeholder, on DevMode's title strip (a swipe
          * pages DevMode like the volume keys) */
+        touch_fast = scene != 1;    /* round 12: ViceNano keeps the 1-in-16 cadence */
         unsigned tap = gesture();
         unsigned keys = input_poll();
         lcd_service();
@@ -178,6 +197,8 @@ void kernel_main(void) {
         if (tap != TAP) keys |= tap, tap = 0;
         if (tap && scene && (scene < SETTINGS || touch.y < TOP_H)) keys |= BUTTON_HOME;
         if (scene == SETTINGS) keys = btui_tick(keys, tap);
+        /* leaving the GPU test: no stalled MBX work left (full launcher redraw follows) */
+        if ((keys & BUTTON_HOME) && drivers_page == 2) mbx_test_leave();
         if (choosing_clock) {
             unsigned old = profile;
             if (keys & BUTTON_LEFT) profile = (profile + 2) % 3;
@@ -228,8 +249,9 @@ void kernel_main(void) {
                 slide = 0;
                 if (!selected) reset_stockos();
                 scene = selected;
-                if (scene == DEVMODE) { devmode_enter(); devmode_draw(); }
+                if (scene == DEVMODE) { devmode_enter(); if (lcd_ready()) devmode_draw(); }
                 else if (scene == SETTINGS) btui_enter();
+                else if (scene == GAME) { touch_fast = 0; game_run(); scene = 0; launcher(selected); }
                 else placeholder(scene);
             } else if (lcd_ready()) {
                 /* one animation step per pushed frame */

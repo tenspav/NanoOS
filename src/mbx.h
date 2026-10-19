@@ -230,4 +230,8 @@ uint32_t mbx_crc32(const uint32_t *w, uint32_t n); /* IEEE, LE words */
 void mbx_test_enter(void);
 void mbx_test_draw(void);
 void mbx_test_key(unsigned keys);  /* Vol+/Vol- (BUTTON_RIGHT/LEFT): variant */
+void mbx_test_leave(void); /* Home from the GPU page: reset a stalled core */
+/* core reset as RetailOS (16 passes) + events acknowledged; mbx_init()
+ * before the next scene */
+void mbx_halt(void);
 #endif

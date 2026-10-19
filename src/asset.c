@@ -2,7 +2,8 @@
 extern const uint8_t __asset_base[], __asset_max[];
 struct npak_entry { char name[32]; uint32_t off, size, padded, crc, sector, rsv[3]; };
 
-static uint32_t crc32(const uint8_t *p, uint32_t n) {
+uint32_t crc32(const void *data, uint32_t n) {
+    const uint8_t *p = data;
     uint32_t c = ~0u;
     while (n--) {
         c ^= *p++;

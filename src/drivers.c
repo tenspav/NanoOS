@@ -15,7 +15,7 @@
  * The font has no J Q Y Z j q = or comma (test_nanoemu.py OCRs this). */
 #define X 8
 #define Y0 30
-#define DY 14   /* 13 lines incl. MBX diag must clear the footer at 226 */
+#define DY 13   /* 15 lines incl. touch counters and MBX diag must clear the footer at 226 */
 #define SENTINEL 0x5a5a5a5au
 static uint32_t *nand_buf;
 static int nand_ok, nand_rd;
@@ -39,8 +39,10 @@ void drivers_enter(void) {
     bt_start();
     audio_init();   /* codec probe, 2 s test.pcm, R82; last: audio_service() follows */
 }
+/* round 12: no touch_poll() here: main.c's gesture() polls every pass, so
+ * the page no longer takes a report (a DOWN / UP) from it; it shows what
+ * gesture() read */
 void drivers_service(void) {
-    touch_poll();
     buttons_poll();
     bt_service();
     audio_service();    /* keeps the DMA fed; ends by itself if not called */
@@ -68,8 +70,9 @@ void drivers_draw(void) {
         fmt_str(" x "); fmt_dec((uint32_t)touch.x); fmt_str(" y "); fmt_dec((uint32_t)touch.y);
         fmt_str(touch.state == TOUCH_DOWN ? " down" : touch.state == TOUCH_MOVE ? " move" : " up");
     }
-    if (touch.errors) { fmt_str(" er "); fmt_dec(touch.errors); }
+    fmt_str(" er "); fmt_dec(touch.errors);
     fmt_line(X, y, WHITE); y += DY;
+    y = touch_lines(X, y, DY);      /* round 12: transport counters */
 
     status("BTN   ", "OK");
     fmt_str("now "); keys(buttons.now); fmt_str(" seen "); keys(buttons.seen);
@@ -93,12 +96,22 @@ void drivers_draw(void) {
     if (nand_ok) {
         fmt_str("PPN "); fmt_dec(nand.page_size); fmt_str("B ");
         fmt_dec(nand.pages); fmt_str("pg rd p0 ");
-        fmt_str(nand_rd ? "fail" : nand_buf[0] == SENTINEL ? "no dma" :
-                nand_meta[0] == 0xffffffffu ? "blank" : "data");
+        /* round 11: a failed read shows its phase instead of "fail" (2 cmd,
+         * 4 addr, 800000 poll, 1 status fail bit (round 15), 8 arm, 100
+         * FIFO) and the status byte; <= 51 chars */
+        if (nand_rd) {
+            fmt_str("ph "); fmt_hex(nand.p0 & 0xffffffu, 6); fmt_str(" st "); fmt_hex(nand.p0 >> 24, 2);
+        } else {    /* round 15: + the status byte (bit 4 does not fail a read) */
+            fmt_str(nand_buf[0] == SENTINEL ? "no dma" : nand_meta[0] == 0xffffffffu ? "blank" : "data");
+            fmt_str(" st "); fmt_hex(nand.p0 >> 24, 2);
+        }
         fmt_str(" t"); fmt_dec(nand.attempt);   /* probe attempt that answered */
-    } else {    /* id, FMC +0x00 and +0x48 as found, failed waits (R81 has st) */
-        fmt_str("id "); fmt_hex(nand.id, 8); fmt_str(" cs "); fmt_hex(nand.cs, 8);
-        fmt_str(" 48 "); fmt_hex(nand.st48, 8); fmt_str(" er "); fmt_dec(nand.errors);
+    } else {    /* id, ctl_init step, FMC +0x00 write-readback, recovery
+                 * step that latched it (rc 0..5, nand.h), failed waits
+                 * (R81 has st, +0x48 and +0x00 as found); <= 50 chars */
+        fmt_str("id "); fmt_hex(nand.id, 8); fmt_str(" in "); fmt_dec(nand.init);
+        fmt_str(" cs "); fmt_hex(nand.cs, 8); fmt_str(" rc "); fmt_dec(nand.rcv);
+        fmt_str(" er "); fmt_dec(nand.errors);
     }
     fmt_line(X, y, WHITE); y += DY;
 

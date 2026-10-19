@@ -5,6 +5,7 @@
 #include "timer.h"
 #include "fmt.h"
 #include "report.h"
+#include "input.h"
 /* Bluetooth: controller bring-up and gamepad (HID) host over its HCI (H4) UART.
  *
  * Controller: Broadcom BCM2076B1 (patchram string at 0x0890cbfa). UART 1 at
@@ -39,7 +40,9 @@
  * 250 ms, Reset again (BT_PATCH is left there). At 115200 (no
  * fc18 baud change) it takes ~3 s; the main loop keeps running.
  *
- * Gamepad host (2026-10-17): Write_Simple_Pairing_Mode -> Inquiry (first
+ * Gamepad host (2026-10-17): (round 11: Set_Event_Mask FF..FF 1F first,
+ * after Read_Local_Version, so the SSP events 31/33/36 reach us; Reset's
+ * default mask leaves them off) Write_Simple_Pairing_Mode -> Inquiry (first
  * Class of Device major 0x05 = peripheral/gamepad, or page BT_PAD_ADDR) ->
  * Create_Connection -> Authentication_Requested with SSP "Just Works"
  * (IO capability NoInputNoOutput, user confirmation auto-accepted, link key
@@ -53,7 +56,12 @@
  * (lx ly rx ry l2 r2 counter b0 b1 b2), 0x3f Switch Pro / 8BitDo simple
  * (b0 b1 hat lx16 ly16..), and NanoEmu's NanoPad (7 bytes, no report ID).
  * A failure past bring-up disconnects and searches again (bt.retries).
- * Every wait is a step deadline: 1.5 s up to SSP, 12 s after. */
+ * Every wait is a step deadline: 1.5 s up to SSP, 12 s after (round 11:
+ * restarted at every new bt.phase, e.g. key -> io -> confirm -> auth).
+ * Round 11: a nonzero Command Complete / Status fails the step only for
+ * the command it waits on (expect; a pairing reply counts while sent);
+ * the pairing events are answered only for bt.peer, the link events only
+ * for its handle; the link key is kept with its BD_ADDR. */
 #define UART(o) (*(volatile uint32_t *)(0x3db00000u + (o)))
 #define GPIO(o) (*(volatile uint32_t *)(0x3cf00000u + (o)))
 #define CLKCON(o) (*(volatile uint32_t *)(0x3c500000u + (o)))
@@ -85,6 +93,15 @@ static const uint8_t *patch;    /* next patchram record */
 static uint16_t patch_op;       /* opcode in flight while patching */
 static const uint8_t cfg_addr[6] = BT_PAD_ADDR;
 static uint8_t ident = 1, found, have_key, key[16];
+/* round 11: key_addr: whose key; naming: a Remote_Name_Request is out
+ * (BT_INQ is the inquiry or the names after it); expect: the command the
+ * step waits on (0 after a Disconnect); disc: the handle a Disconnect is
+ * out for (a retry waits for it); retry_t0: when the retry was scheduled
+ * (fix16: or the queued search); queued: a search/page waits for disc's
+ * Disconnection Complete */
+static uint8_t key_addr[6], naming, queued;
+static uint16_t expect, disc;
+static uint32_t retry_t0;
 /* Bluetooth Central: 0 automatic (first gamepad / BT_PAD_ADDR), 1 list
  * every device, 2 page target */
 static uint8_t central, target[6];
@@ -99,19 +116,24 @@ static uint8_t pkt[MAX_PKT];
 static unsigned pos, need, skip, body_known;
 static uint32_t rxlog[12];      /* first 48 bytes received, for R85 */
 static uint32_t clk[2];         /* clock 5 kHz, UART divisor (R85) */
-/* PMU bus 1 diagnosis (R85 v5 "bus" words):
+/* PMU bus 1 diagnosis (R85 v7 "bus" words):
  *   0-2 CLKCON +0x14 +0x4c +0x6c as found; 3-11 IIC +0x00..+0x20 as found
- *   (read with the gates opened); 12 unstick: 1 = found busy (IICSTAT bit
- *   5) or pending (IICCON bit 4) | NACKed byte WAIT_* result << 8 (01 ok,
- *   00 timeout) | STOP done << 16; 13-21 IIC +0x00..+0x20 after the unstick
+ *   (read with the gates opened); 12 unstick (round 10b: input.c
+ *   input_i2c_recover's bits: 1 busy/pending found, 0x10 still busy after
+ *   RetailOS's clear, 2 RX byte NACKed, 4 its byte done, 8 STOP lost);
+ *   13-21 IIC +0x00..+0x20 after the unstick
  *   and RetailOS's init; 22 first PMU read: byte | status << 8 (0 ok, 1
  *   address NACK, 2 data NACK, 3 no byte done) | 1 << 16 (done: status kept
- *   apart from the byte, a real FF reads 0x100ff); 23-31 at the first
+ *   apart from the byte, a real FF reads 0x100ff; | 0x10 STOP never
+ *   done, kept with the first failed stage, fix14);
+ *   23-31 at the first
  *   failed transfer: IICCON IICSTAT +0x20 IICDS +0x10, stage | transfer
  *   << 8, CLKCON +0x4c +0x6c +0x14; 32 STOPs re-issued | STOPs never done
  *   << 16; 33-35 PMU reads before power-up, as word 22: reg 0x00 (ID),
- *   0x07 (input.c's Home), 0x47 (Home per AGY's RE, bit 6) */
-#define BUS_N 36
+ *   0x07 (input.c's Home), 0x47 (Home per AGY's RE, bit 6); 36-42 (round
+ *   10) right after the VIC IRQ 22 enable: VIC +00 +08 +10, IIC +00 +04
+ *   +20 +10 (input_i2c_vic) */
+#define BUS_N 43
 static uint32_t bus[BUS_N], xfers;
 static const uint8_t pmu_regs[3] = {0x52, 0x56, 0x4b};
 #define I2C(o) (*(volatile uint32_t *)(0x3c900000u + (o)))
@@ -124,6 +146,7 @@ static void tx(const uint8_t *p, unsigned n) {
 }
 static void hci_cmd(uint16_t op, const uint8_t *par, unsigned n) {
     uint8_t h[4] = {0x01, (uint8_t)op, (uint8_t)(op >> 8), (uint8_t)n};
+    expect = op == 0x0406 ? 0 : op;
     tx(h, 4);
     tx(par, n);
 }
@@ -151,34 +174,82 @@ static void sig(uint8_t code, uint8_t id, const uint8_t *d, unsigned n) {
     acl_send(0x0001, p, 4 + n);
 }
 static void step(unsigned s) { bt.step = s; step_t0 = USEC; }
+/* round 11: a new phase (bt.h BT_PH_*) restarts the step's deadline */
+static void phase(unsigned ph) {
+    if (ph != bt.phase) step_t0 = USEC;
+    bt.phase = (uint8_t)ph;
+}
+static int eq6(const uint8_t *a, const uint8_t *b) {
+    unsigned k = 0;
+    while (k < 6 && a[k] == b[k]) ++k;
+    return k == 6;
+}
 static void patch_done(void);
 static void report(void);
+/* round 11: no channel state of an earlier link survives a new one */
+static void link_clear(void) {
+    found = naming = 0;
+    for (unsigned i = 0; i < 2; ++i) remote[i] = opened[i] = peer_cfg[i] = our_cfg[i] = 0;
+}
+static void page(void) {
+    static const uint8_t c[7] = {0x18, 0xcc, 0x01, 0, 0, 0, 0x01};  /* DM1..DH5, R1, role switch */
+    link_clear();
+    addr_cmd(0x0405, bt.peer, c, 7);            /* Create_Connection */
+    step(BT_CONNECT);
+    phase(BT_PH_PAGE);
+}
 static void search(void) {
     unsigned any = 0;
     for (unsigned i = 0; i < 6; ++i) any |= bt.peer[i] = central ? target[i] : cfg_addr[i];
     if (central == 1) any = bt_ndev = 0;
-    found = 0;
-    opened[0] = opened[1] = 0;
-    if (any) {
-        static const uint8_t c[7] = {0x18, 0xcc, 0x01, 0, 0, 0, 0x01};  /* DM1..DH5, R1, role switch */
-        addr_cmd(0x0405, bt.peer, c, 7);        /* Create_Connection */
-        step(BT_CONNECT);
-    } else {
+    if (any) page();
+    else {
         static const uint8_t c[5] = {0x33, 0x8b, 0x9e, 0x08, 0x00};     /* GIAC, 10.24 s */
+        link_clear();
         hci_cmd(0x0401, c, 5);                  /* Inquiry */
         step(BT_INQ);
+        phase(BT_PH_NONE);
     }
 }
+/* round 11, Central's connect: the same target again, twice (1 s, then
+ * 2 s later), after a page / connection / LMP / our own timeout; once
+ * after an authentication or key failure when its cached key was offered
+ * (the key is dropped: the next try pairs afresh). Anything else (refused
+ * security, an L2CAP refusal, the pad's own disconnect) waits for the
+ * user. bt_service starts it, once the Disconnect is done. */
+static void retry(unsigned status) {
+    unsigned t = status == 0x04 || status == 0x08 || status == 0x10 || status == 0x22 || status == 0xff;
+    if ((status == 0x05 || status == 0x06) && have_key && eq6(key_addr, target)) { have_key = 0; t = 1; }
+    if (t && bt.again < 2) { ++bt.again; bt.waiting = 1; retry_t0 = USEC; }
+}
+/* fix16: Disconnect the link, if any; a Disconnect already out keeps its
+ * handle in disc (a call with no link no longer forgets it) */
+static void drop(void) {
+    if (bt.handle) { disc = bt.handle; handle_cmd(0x0406, 0x13); }   /* remote user */
+    bt.handle = 0;
+}
+/* fix16: never page (or search) while a link's teardown is in flight: the
+ * search is queued and starts from that handle's Disconnection Complete
+ * (event(); bt_service bounds the wait at 5 s, a lost event) */
+static void search_after_down(void) {
+    if (!disc) { search(); return; }
+    queued = 1;
+    retry_t0 = USEC;
+}
 static void fail(unsigned status) {
-    bt.failed = bt.step;
+    unsigned was = bt.step;
+    bt.failed = was;
     bt.status = status;
+    bt.fphase = (uint8_t)(bt.phase | 0x80u);    /* round 11: the phase, kept for the UI */
+    bt.phase = BT_PH_NONE;
     bt.pad = (struct bt_pad){0, 0, 0};
-    if (bt.step < BT_INQ) bt.step = BT_ERR;
+    if (was < BT_INQ) bt.step = BT_ERR;
     else {
-        if (bt.handle) handle_cmd(0x0406, 0x13);    /* Disconnect */
-        bt.handle = 0;
+        drop();
         ++bt.retries;
-        if (central) step(BT_READY); else search();
+        step(BT_READY);
+        if (!central) search_after_down();
+        else if (central == 2 && was >= BT_CONNECT && was <= BT_HID) retry(status);
     }
     report();
 }
@@ -195,11 +266,22 @@ static void config_req(unsigned ch) {
     uint8_t c[4] = {(uint8_t)remote[ch], (uint8_t)(remote[ch] >> 8), 0, 0};
     peer_cfg[ch] = our_cfg[ch] = 0;
     sig(0x04, ident++, c, 4);
+    if (ch == bt.step - BT_CTRL) phase(BT_PH_CTRL_CFG + 2 * ch);
 }
-static void channel_progress(unsigned ch) {
-    if (!peer_cfg[ch] || !our_cfg[ch]) return;
-    if (ch == 0 && bt.step == BT_CTRL) step(BT_INTR);
-    else if (ch == 1 && bt.step == BT_INTR) { step(BT_HID); report(); }
+/* round 11: re-checked after every config and on entering BT_CTRL /
+ * BT_INTR, so channels the pad configured early (during BT_AUTH) still
+ * move the steps on */
+static void channel_progress(void) {
+    if (bt.step == BT_CTRL && peer_cfg[0] && our_cfg[0]) {
+        step(BT_INTR);
+        phase(remote[1] ? BT_PH_INTR_CFG : BT_PH_INTR);
+    }
+    if (bt.step == BT_INTR && peer_cfg[1] && our_cfg[1]) {
+        step(BT_HID);
+        bt.again = 0;                           /* a later link loss may retry again */
+        bt.fphase = bt.failed = bt.status = 0;  /* fix16: no stale failure after success */
+        report();
+    }
 }
 static void signalling(const uint8_t *p, unsigned len) {
     while (len >= 4) {
@@ -210,7 +292,7 @@ static void signalling(const uint8_t *p, unsigned len) {
         if (code == 0x02 && n >= 4) {           /* the pad opens a channel */
             unsigned psm = d[0] | d[1] << 8;
             int ch = psm == 0x11 ? 0 : psm == 0x13 ? 1 : -1;
-            if (ch >= 0 && bt.step >= BT_AUTH) {
+            if (ch >= 0 && bt.step - BT_AUTH <= BT_HID - BT_AUTH) {   /* this link, AUTH..HID */
                 uint16_t our = ch ? CID_INTR : CID_CTRL;
                 uint8_t r[8] = {(uint8_t)our, (uint8_t)(our >> 8), d[2], d[3], 0, 0, 0, 0};
                 sig(0x03, id, r, 8);
@@ -224,20 +306,20 @@ static void signalling(const uint8_t *p, unsigned len) {
             if (ch >= 0 && result == 0) {
                 remote[ch] = (uint16_t)(d[0] | d[1] << 8);
                 config_req((unsigned)ch);
-            } else if (ch >= 0 && result != 1) fail(result);
+            } else if (ch >= 0 && result != 1) fail(0x100u | result);   /* 0x1xx: L2CAP */
         } else if (code == 0x04 && n >= 4) {    /* peer's Config Request */
             int ch = channel((uint16_t)(d[0] | d[1] << 8));
             if (ch >= 0 && remote[ch]) {
                 uint8_t r[6] = {(uint8_t)remote[ch], (uint8_t)(remote[ch] >> 8), 0, 0, 0, 0};
                 sig(0x05, id, r, 6);
                 peer_cfg[ch] = 1;
-                channel_progress((unsigned)ch);
+                channel_progress();
             }
         } else if (code == 0x05 && n >= 6) {    /* response to ours */
             int ch = channel((uint16_t)(d[0] | d[1] << 8));
             if (ch >= 0 && !(d[4] | d[5] << 8)) {
                 our_cfg[ch] = 1;
-                channel_progress((unsigned)ch);
+                channel_progress();
             }
         } else if (code == 0x06 && n >= 4) {    /* Disconnection Request */
             sig(0x07, id, d, 4);
@@ -292,34 +374,51 @@ static void acl(const uint8_t *p, unsigned n) {
     if (cid == 0x0001) signalling(d, len);
     else if (cid == CID_INTR && bt.step == BT_HID && len >= 7 && d[0] == 0xa1) hid_report(d, len);
 }
+/* "AA:BB:CC:DD:EE:FF" (display order) + NUL: 18 bytes */
+static void addr_text(char *t, const uint8_t *a) {
+    static const char hx[] = "0123456789ABCDEF";
+    for (unsigned i = 6; i--;) { *t++ = hx[a[i] >> 4]; *t++ = hx[a[i] & 15]; *t++ = i ? ':' : 0; }
+}
 /* Central's list: the entry of address a (a new one, up to BT_DEVS, is
- * cleared), its class of device kept when cod is given */
+ * named by its address until a name comes), its class of device kept
+ * when cod is given */
 static struct bt_dev *dev_add(const uint8_t *a, const uint8_t *cod) {
     unsigned i = 0, k;
-    for (; i < bt_ndev; ++i) {
-        for (k = 0; k < 6 && bt_devs[i].addr[k] == a[k]; ++k) ;
-        if (k == 6) break;
-    }
+    while (i < bt_ndev && !eq6(bt_devs[i].addr, a)) ++i;
     if (i == BT_DEVS) return 0;
     struct bt_dev *d = &bt_devs[i];
-    if (i == bt_ndev) { ++bt_ndev; d->named = 0; d->name[0] = 0; }
+    if (i == bt_ndev) { ++bt_ndev; d->named = 0; addr_text(d->name, a); }
     for (k = 0; k < 6; ++k) d->addr[k] = a[k];
     if (cod) for (k = 0; k < 3; ++k) d->cod[k] = cod[k];
     return d;
 }
+/* an empty name keeps the address */
 static void set_name(struct bt_dev *d, const uint8_t *s, unsigned n) {
     unsigned m = 0;
+    if (!n || !*s) return;
     for (; m < n && m < 17 && s[m]; ++m) d->name[m] = (char)s[m];
     d->name[m] = 0;
     d->named = 1;
 }
-/* after the inquiry: one Remote_Name_Request at a time, then ready */
+const char *bt_name(const uint8_t *a) {
+    static char t[18];
+    for (unsigned i = 0; i < bt_ndev; ++i)
+        if (eq6(bt_devs[i].addr, a)) return bt_devs[i].name;
+    addr_text(t, a);
+    return t;
+}
+/* after the inquiry: one Remote_Name_Request at a time, then ready;
+ * round 11: a connect chosen meanwhile (found) pages instead, so no name
+ * request starts after it */
 static void next_name(void) {
+    naming = 0;
+    if (found) { page(); return; }
     for (unsigned i = 0; i < bt_ndev; ++i)
         if (!bt_devs[i].named) {
             static const uint8_t c[4] = {0x01, 0, 0, 0};   /* R1, clock offset unknown */
             bt_devs[i].named = 2;
             addr_cmd(0x0419, bt_devs[i].addr, c, 4);
+            naming = 1;
             step(BT_INQ);
             return;
         }
@@ -332,7 +431,14 @@ static void event(const uint8_t *p, unsigned n) {
     const uint8_t *a = p + 3;                   /* BD_ADDR of the pairing events */
     if (code == 0x0e && n >= 7) {               /* Command Complete */
         unsigned op = p[4] | p[5] << 8, status = p[6];
-        if (status) { fail(status); return; }
+        if (op == 0x0402) {                     /* Inquiry_Cancel: any status (the */
+            if (bt.step == BT_INQ && found) page();   /* inquiry may have just ended) */
+            return;
+        }
+        if (status) {                           /* only the command waited on fails */
+            if (op == (bt.step == BT_PATCH ? patch_op : expect)) fail(status);
+            return;
+        }
         if (op == 0x0c03 && bt.step == BT_RESET && !bt.patched) {
             patch = (const uint8_t *)PATCH;
             if (BT_PATCHRAM && *(const volatile uint16_t *)PATCH == 0xfc4c &&
@@ -369,17 +475,21 @@ static void event(const uint8_t *p, unsigned n) {
             bt.mfr = (uint16_t)(p[11] | p[12] << 8);
             bt.lmp_sub = (uint16_t)(p[13] | p[14] << 8);
             bt.have_ver = 1;
+            /* round 11: every classic event (BTstack's mask), SSP's too */
+            static const uint8_t mask[8] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x1f};
+            hci_cmd(0x0c01, mask, 8);           /* Set_Event_Mask */
+            step(BT_SSP);
+            phase(BT_PH_MASK);
+        } else if (op == 0x0c01 && bt.step == BT_SSP) {
             static const uint8_t on = 1;
             hci_cmd(0x0c56, &on, 1);            /* Write_Simple_Pairing_Mode */
+            phase(BT_PH_NONE);
             step(BT_SSP);
-        } else if (op == 0x0c56 && bt.step == BT_SSP) search();
-        else if (op == 0x0402 && bt.step == BT_INQ && found) {
-            static const uint8_t c[7] = {0x18, 0xcc, 0x01, 0, 0, 0, 0x01};
-            addr_cmd(0x0405, bt.peer, c, 7);    /* Create_Connection */
-            step(BT_CONNECT);
-        }
+        } else if (op == 0x0c56 && bt.step == BT_SSP && !bt.phase) search();
     } else if (code == 0x0f && n >= 7) {        /* Command Status */
-        if (p[3]) fail(p[3]);
+        unsigned op = p[5] | p[6] << 8;
+        if (p[3] && op == 0x0419 && bt.step == BT_INQ) next_name();   /* no name: the next */
+        else if (p[3] && op == expect) fail(p[3]);
     } else if ((code == 0x02 || code == 0x22 || code == 0x2f) && n >= 16 &&
                bt.step == BT_INQ && !found) {   /* Inquiry Result (std / RSSI / EIR) */
         if (central) {
@@ -398,32 +508,54 @@ static void event(const uint8_t *p, unsigned n) {
         struct bt_dev *d = dev_add(p + 4, 0);  /* Remote_Name_Request_Complete */
         if (d && !p[3]) set_name(d, p + 10, n - 10);
         next_name();
-    } else if (code == 0x03 && n >= 6 && bt.step == BT_CONNECT) {
+    } else if (code == 0x03 && n >= 12 && bt.step == BT_CONNECT && eq6(p + 6, bt.peer)) {
         if (p[3]) { fail(p[3]); return; }       /* Connection Complete */
         bt.handle = (uint16_t)((p[4] | p[5] << 8) & 0xfff);
         handle_cmd(0x0411, 0);                  /* Authentication_Requested */
         step(BT_AUTH);
-    } else if (code == 0x17 && n >= 9) {        /* Link_Key_Request */
-        if (have_key) addr_cmd(0x040b, a, key, 16);
-        else addr_cmd(0x040c, a, 0, 0);
-    } else if (code == 0x18 && n >= 25) {       /* Link_Key_Notification */
-        for (unsigned i = 0; i < 16; ++i) key[i] = p[9 + i];
-        have_key = 1;
-    } else if (code == 0x31 && n >= 9) {        /* IO_Capability_Request */
-        static const uint8_t c[3] = {0x03, 0x00, 0x04};  /* NoInputNoOutput, no OOB, bonding */
-        addr_cmd(0x042b, a, c, 3);
-    } else if (code == 0x33 && n >= 9) {        /* User_Confirmation_Request */
-        addr_cmd(0x042c, a, 0, 0);              /* Just Works: accept */
-    } else if (code == 0x06 && n >= 6 && bt.step == BT_AUTH) {
-        if (p[3]) { fail(p[3]); return; }       /* Authentication_Complete */
-        handle_cmd(0x0413, 1);                  /* Set_Connection_Encryption on */
-    } else if (code == 0x08 && n >= 7 && bt.step == BT_AUTH) {
-        if (p[3] || !p[6]) { fail(p[3] ? p[3] : 0xfd); return; }  /* Encryption_Change */
-        step(BT_CTRL);
-    } else if (code == 0x05 && n >= 7 && bt.handle &&
+        phase(BT_PH_KEY);
+    } else if ((code == 0x17 || code == 0x18 || code == 0x31 || code == 0x33) && n >= 9 &&
+               eq6(a, bt.peer) && bt.step - BT_CONNECT <= BT_HID - BT_CONNECT) {
+        /* the pairing events, the pad's only (round 11) */
+        if (code == 0x17) {                     /* Link_Key_Request */
+            phase(BT_PH_KEY);
+            if (have_key && eq6(key_addr, a)) addr_cmd(0x040b, a, key, 16);
+            else addr_cmd(0x040c, a, 0, 0);
+        } else if (code == 0x18 && n >= 25) {   /* Link_Key_Notification */
+            for (unsigned i = 0; i < 16; ++i) key[i] = p[9 + i];
+            for (unsigned i = 0; i < 6; ++i) key_addr[i] = a[i];
+            have_key = 1;
+        } else if (code == 0x31) {              /* IO_Capability_Request */
+            static const uint8_t c[3] = {0x03, 0x00, 0x04};  /* NoInputNoOutput, no OOB, bonding */
+            phase(BT_PH_IO);
+            addr_cmd(0x042b, a, c, 3);
+        } else if (code == 0x33) {              /* User_Confirmation_Request */
+            phase(BT_PH_CONFIRM);
+            addr_cmd(0x042c, a, 0, 0);          /* Just Works: accept */
+        }
+    } else if (code == 0x36 && n >= 10 && eq6(p + 4, bt.peer) && bt.step == BT_AUTH) {
+        if (p[3]) { fail(p[3]); return; }       /* Simple_Pairing_Complete */
+        phase(BT_PH_AUTH);
+    } else if ((code == 0x05 || code == 0x06 || code == 0x08) && n >= 6 && bt.handle &&
                ((p[4] | p[5] << 8) & 0xfff) == bt.handle) {
-        bt.handle = 0;                          /* Disconnection Complete */
-        fail(p[6]);
+        /* the link events, its handle's only */
+        if (code == 0x06 && bt.step == BT_AUTH) {
+            if (p[3]) { fail(p[3]); return; }   /* Authentication_Complete */
+            handle_cmd(0x0413, 1);              /* Set_Connection_Encryption on */
+            phase(BT_PH_ENCRYPT);
+        } else if (code == 0x08 && n >= 7 && bt.step == BT_AUTH) {
+            if (p[3] || !p[6]) { fail(p[3] ? p[3] : 0xfd); return; }  /* Encryption_Change */
+            step(BT_CTRL);
+            phase(remote[0] ? BT_PH_CTRL_CFG : BT_PH_CTRL);   /* the pad may have opened it */
+            channel_progress();                 /* or configured both already */
+        } else if (code == 0x05 && n >= 7) {    /* Disconnection Complete */
+            bt.handle = 0;
+            fail(p[6]);
+        }
+    }
+    if (code == 0x05 && n >= 7 && ((p[4] | p[5] << 8) & 0xfff) == disc) {   /* ours is done */
+        disc = 0;
+        if (queued && bt.step == BT_READY) { queued = 0; search(); }        /* fix16 */
     }
 }
 static void rx_byte(uint8_t b) {
@@ -475,15 +607,25 @@ static __attribute__((noinline)) void pin(unsigned p, unsigned cmd) {
  *    device found it gated: 0x80002200). Kernel f5b9a0db, which never
  *    gated, read the PMU 83..100 times per run;
  *  - IICCON bit 4 (pending: SCL held) never cleared before a START: START
- *    now writes IICCON whole (0x2181: ACK, events 0x2100, prescaler 1 as
- *    RetailOS's init 0x080017b4);
- *  - STOP given 1 ms once: RetailOS re-issues it for up to 100 ms; here 5
- *    times 1 ms, then the controller is idled (IICSTAT 0x10).
+ *    now writes IICCON whole: 0x181 (ACK, byte-done event, prescaler 1)
+ *    as RetailOS's START 0x22000652 (round 10: bit 13, the STOP-done
+ *    event, only once the STOP is issued; was 0x2181), after the 5-tick
+ *    (here 50 us) gap;
+ *  - STOP given 1 ms once: RetailOS re-issues it for up to 100 ms, so do
+ *    we now (round 10; was 5 ms); never done = the transfer failed.
  * byte done = +0x20 bit 8 only (never IICCON bit 4 alone: a stale pending
  * bit ends the wait with IICDS still holding the address, the device's
  * 0xE7); the last byte's ACK is not checked. addr 0xe6: send b[0..n-1];
- * 0xe7: read b[0] (NACKed). 0 ok, else the stage. */
-static int i2c_byte(void) { return wait_any(&I2C(0x20), 0x100u, 10000u) == WAIT_OK; }
+ * 0xe7: read b[0] (NACKed). 0 ok, else the stage | 0x10 if the STOP was
+ * never done (also after an earlier failed stage: a wedged bus, fix14). */
+/* round 10b: or IICSTAT bit5 (busy) clear, as RetailOS's polled wait
+ * 0x22000588 and input.c byte_done() */
+static int i2c_byte(void) {
+    uint32_t t0 = USEC;
+    for (uint32_t n = 0; n < 10000u * 64u && USEC - t0 < 10000u; ++n)
+        if ((I2C(0x20) & 0x100u) || !(I2C(0x04) & 0x20u)) return 1;
+    return 0;
+}
 static void gates_on(void) {
     CLKCON(0x14) &= ~0x80000000u;
     CLKCON(0x4c) &= ~0x40u;
@@ -492,12 +634,11 @@ static void gates_on(void) {
 }
 /* resume as input.c resume_ack() and the ISR (0x220013e2..0x2200141a):
  * IICCON with bit 4 clear and the ACK bit as given, +0x20 W1C, IICCON
- * written again */
+ * reread and written back */
 static void i2c_next(uint32_t ack) {
-    uint32_t c = (I2C(0x00) & ~0x90u) | ack;
-    I2C(0x00) = c;
+    I2C(0x00) = (I2C(0x00) & ~0x90u) | ack;
     I2C(0x20) = 0x100u;
-    I2C(0x00) = c;
+    I2C(0x00) = I2C(0x00);
 }
 /* RetailOS's I2C init 0x080017b4 (+0x08 = 0x40: own address, 0x080017c0
  * -> 0x08002228; +0x20: no stale events) */
@@ -508,23 +649,24 @@ static void i2c_init(void) {
     };
     for (unsigned i = 0; i < sizeof init / sizeof init[0]; ++i) I2C(init[i][0]) = init[i][1];
 }
-/* STOP as input.c stop(): STOP-done W1C, IICCON bit 13 on; then up to 5 x
- * (IICSTAT = mode, resume, 1 ms for +0x20 bit 13 or IICSTAT bit 5 clear);
- * done: IICCON &= ~0x2010, W1C, IICCON again (0x220013b8); never done:
- * the controller is initialised again. Each wait also has a spin backstop. */
+/* STOP as input.c stop(): STOP-done W1C, IICCON bit 13 on; then up to
+ * 100 x (IICSTAT = mode, resume, 1 ms for +0x20 bit 13 or IICSTAT bit 5
+ * clear), RetailOS's 100 ms; done: IICCON &= ~0x2010, W1C, IICCON reread
+ * and written back (0x220013b8); never done: the controller is
+ * initialised again and 0 returned (the transfer failed). Each wait also
+ * has a spin backstop. */
 static int i2c_stop(unsigned mode) {
     I2C(0x20) = 0x2000u;
     I2C(0x00) |= 0x2000u;
-    for (unsigned t = 0; t < 5; ++t) {
+    for (unsigned t = 0; t < 100; ++t) {
         I2C(0x04) = mode;                       /* bit 5 clear: STOP */
         i2c_next(0x80u);
         uint32_t t0 = USEC;
         for (uint32_t n = 0; n < 1000u * 64u && USEC - t0 < 1000u; ++n)
             if ((I2C(0x20) & 0x2000u) || !(I2C(0x04) & 0x20u)) {
-                uint32_t c = I2C(0x00) & ~0x2010u;
-                I2C(0x00) = c;
+                I2C(0x00) &= ~0x2010u;
                 I2C(0x20) = 0x2100u;
-                I2C(0x00) = c;
+                I2C(0x00) = I2C(0x00);
                 return 1;
             }
         ++bus[32];
@@ -533,20 +675,20 @@ static int i2c_stop(unsigned mode) {
     i2c_init();
     return 0;
 }
-/* Before BT's first transfer: snapshot, and a controller left busy or
- * pending (handoff mid-transfer, or an earlier timeout) gets its byte
- * finished NACKed (9 clocks: a slave holding SDA lets go) and a STOP;
- * then RetailOS's init 0x080017b4. Bounded: 10 ms + 5 ms. */
+/* Before BT's first transfer: snapshot, the VIC IRQ 22 enable (round
+ * 10, as input.c: CPU IRQs stay masked), then input.c's unstick (round
+ * 10b: RetailOS's clear 0x220011ec, W1C 0x3f00 and IICCON bit4 cleared;
+ * still busy: RX byte NACKed, STOP in a valid mode; the round-10 code
+ * waited 10 ms for a byte that never came, then sent STOP mode 0x00) and
+ * RetailOS's init 0x080017b4 (again: + the own address). Bounded:
+ * 5 ms + 100 ms. */
 static void i2c_open(void) {
     bus[0] = CLKCON(0x14); bus[1] = CLKCON(0x4c); bus[2] = CLKCON(0x6c);
     gates_on();
     delay_us(50);
     for (unsigned i = 0; i < 9; ++i) bus[3 + i] = I2C(4 * i);
-    if ((I2C(0x04) & 0x20u) || (I2C(0x00) & 0x10u)) {
-        i2c_next(0);
-        bus[12] = 1 | (uint32_t)i2c_byte() << 8;
-        bus[12] |= (uint32_t)i2c_stop(I2C(0x04) & 0xd0u) << 16;
-    }
+    input_i2c_vic(&bus[36]);
+    bus[12] = input_i2c_recover();
     i2c_init();
     delay_us(50);
     for (unsigned i = 0; i < 9; ++i) bus[13 + i] = I2C(4 * i);
@@ -554,8 +696,9 @@ static void i2c_open(void) {
 static unsigned i2c_xfer(unsigned addr, uint8_t *b, unsigned n) {
     unsigned mode = addr & 1 ? 0x90u : 0xd0u, st = 0;
     gates_on();                                 /* and never off again */
+    delay_us(50);                               /* RetailOS: 5 ticks after the last */
     I2C(0x20) = 0x2100u;
-    I2C(0x00) = 0x2181u;                        /* pending bit 4 clear */
+    I2C(0x00) = 0x181u;                         /* pending bit 4 clear, no STOP event */
     I2C(0x04) = mode;
     I2C(0x0c) = addr;
     I2C(0x04) = mode | 0x20u;                   /* START + address */
@@ -575,7 +718,7 @@ static unsigned i2c_xfer(unsigned addr, uint8_t *b, unsigned n) {
         for (unsigned i = 0; i < 9; ++i)
             bus[23 + i] = at[i] ? *(volatile uint32_t *)at[i] : st | xfers << 8;
     }
-    i2c_stop(mode);
+    if (!i2c_stop(mode)) st |= 0x10u;
     return st;
 }
 static int pmu_get(unsigned reg) {
@@ -601,6 +744,7 @@ static int pmu_set(unsigned reg, unsigned val, uint8_t *rb) {
         got(rb, r);
         if (r == (int)val) return 1;
         ++bt.pmu_err;
+        if (bt.i2c_st & 0x10u) return 0;        /* STOP lost (100 ms): no retry */
     }
     return 0;
 }
@@ -658,15 +802,16 @@ static unsigned power_up(void) {
 /* R85 (report.h mailbox, NanoOSLoader exports R85.txt): a free slot or
  * the last R85, searched from slot 3 down to 0 (the Drivers page's R81 R82
  * R84 take 1..3 first), else slot 0 (GPU test R50). Written on every
- * failure and when the pad comes up. Header "== BT R85 v5 ==" (v5 =
+ * failure and when the pad comes up. Header "== BT R85 v8 ==" (v8 =
  * this layout), one line per 6 words, "address: words" (little-endian
  * words):
  *   struct bt_state, one word each (bt.h): step, failed, status, peer[0..3],
  *   peer[4..5] handle, events, acl, reports, dropped, retries, pad lx ly -,
  *   pad buttons, have_ver hci_ver tries patched, mfr lmp_sub, pmu[0][0..2]
- *   pmu[1][0], pmu[1][1..2] i2c_st pmu_ok, pmu_err, rxn; then clock 5 kHz
+ *   pmu[1][0], pmu[1][1..2] i2c_st pmu_ok, pmu_err, rxn, (v8) phase fphase
+ *   again waiting; then clock 5 kHz
  *   + divisor, UART +0x00..+0x28 (read at the end: the +0x24 read pops one
- *   RX byte), bus[48] (above: PMU bus check + first failed transfer),
+ *   RX byte), bus[43] (above: PMU bus check + first failed transfer),
  *   I2C1 +0x00..+0x10 and +0x20 at the end (gates opened first), GPIO
  *   bank 8 (pin 70), CLKCON +0x10 (clock 5) +0x14, RetailOS's
  *   patchram in DRAM (4cfc..), the first 48 RX bytes */
@@ -687,7 +832,7 @@ static void report(void) {
     char *p0 = RPT_SLOT(s);
     fmt_out = p0;
     fmt_end = p0 + 4096;
-    fmt_str("== BT R85 v5 =="); fmt_line(0, 0, 0);
+    fmt_str("== BT R85 v8 =="); fmt_line(0, 0, 0);
     gates_on();                                 /* the IIC words below read clocked (they stay on) */
     for (unsigned d = 0; d < sizeof dump / sizeof dump[0]; ++d)
         for (unsigned i = 0; i < dump[d][1]; i += 6) {
@@ -726,6 +871,7 @@ void bt_start(void) {
     for (unsigned i = 0; i < BUS_N; ++i) bus[i] = 0;
     have_key = 0;
     xfers = 0;
+    disc = queued = 0;                          /* a new controller: no teardown in flight */
     unsigned e = power_up();
     if (e) {                                    /* "ERR ERR pmu Ex": no HCI */
         bt.failed = BT_PMU;
@@ -743,6 +889,19 @@ void bt_service(void) {
         if (bt.rxn < sizeof rxlog) ((uint8_t *)rxlog)[bt.rxn] = b;
         ++bt.rxn;
         rx_byte(b);
+    }
+    uint32_t w = USEC - retry_t0;
+    /* round 11: a scheduled retry pages the same target, once the
+     * Disconnect is done (5 s at most); fix16: so does a queued search
+     * whose Disconnection Complete never came. Nothing else this pass:
+     * the deadline below would still see the old step's t0 and fail the
+     * fresh page at once (fix16, it did) */
+    if (bt.step == BT_READY && ((bt.waiting && w >= bt.again * 1000000u && (!disc || w >= 5000000u)) ||
+                                (queued && w >= 5000000u))) {
+        bt.waiting = queued = 0;
+        disc = 0;
+        search();
+        return;
     }
     uint32_t t = USEC - step_t0;
     unsigned ch = bt.step - BT_CTRL;
@@ -763,28 +922,41 @@ int bt_pad_poll(struct bt_pad *p) {
     bt_service();
     return bt_pad_state(p);
 }
+/* fix16: an explicit disconnect also clears the saved failure (and
+ * whatever search was queued) */
 void bt_disconnect(void) {
-    if (bt.handle) handle_cmd(0x0406, 0x13);    /* Disconnect, remote user */
-    bt.handle = 0;
+    drop();
+    bt.waiting = queued = 0;
+    bt.fphase = bt.failed = bt.status = 0;
+    bt.phase = BT_PH_NONE;
     bt.pad = (struct bt_pad){0, 0, 0};
     if (bt.step > BT_INQ && bt.step <= BT_HID) step(BT_READY);
 }
 /* manual mode m: started if off (search follows the bring-up), else
  * searched from ready or a link (dropped first); a search is cancelled for
  * a connect (Inquiry_Cancel's Command Complete pages, as the automatic
- * mode); during bring-up or a connect only the mode changes */
+ * mode; round 11: a name request is not cancelled, its completion pages);
+ * during bring-up or a connect only the mode changes. An explicit action
+ * cancels a scheduled retry and clears the shown failure. fix16: while an
+ * earlier link's Disconnect is out, the search/page waits for its
+ * Disconnection Complete. */
 static void central_go(unsigned m) {
     central = (uint8_t)m;
+    bt.waiting = bt.fphase = 0;
     if (bt.step == BT_OFF || bt.step == BT_ERR) bt_start();
-    else if (bt.step == BT_INQ && m == 2) {     /* searching: cancel, then page */
+    else if (bt.step == BT_INQ && m == 2) {     /* searching: page after it */
         for (unsigned i = 0; i < 6; ++i) bt.peer[i] = target[i];
         found = 1;
-        hci_cmd(0x0402, 0, 0);
-    } else if (bt.step >= BT_HID) { bt_disconnect(); search(); }
+        if (!naming) hci_cmd(0x0402, 0, 0);     /* Inquiry_Cancel */
+    } else if (bt.step >= BT_HID) { bt_disconnect(); search_after_down(); }   /* fix16 */
 }
 void bt_scan(void) { central_go(1); }
+/* round 11: a new target drops the other pad's key; the retry budget
+ * starts again */
 void bt_connect(const uint8_t *a) {
     for (unsigned i = 0; i < 6; ++i) target[i] = a[i];
+    if (!eq6(a, key_addr)) have_key = 0;
+    bt.again = 0;
     central_go(2);
 }
 void bt_power(int on) {
@@ -796,6 +968,11 @@ void bt_power(int on) {
     CLKCON(0x4c) |= 0x20000000u;                /* UART1 gate id 16 off */
     CLKCON(0x6c) |= 0x100u;
     bt.step = BT_OFF;
+}
+const char *bt_phase_name(unsigned ph) {
+    static const char *const names[] = {"", "mask", "page", "key", "io", "confirm", "auth",
+                                         "encrypt", "ctrl", "ctrl cfg", "intr", "intr cfg"};
+    return ph < 12 ? names[ph] : "?";
 }
 const char *bt_step_name(unsigned s) {
     static const char *const names[] = {"off", "reset", "patch", "ver", "ssp", "inq",
@@ -817,8 +994,9 @@ const char *bt_step_name(unsigned s) {
 void bt_line(void) {
     fmt_str("BT    ");
     if (bt.step == BT_HID) {
-        fmt_str("OK PAD ok ");
-        for (unsigned i = 6; i--;) { fmt_hex(bt.peer[i], 2); if (i) fmt_str(":"); }
+        char m[18];
+        addr_text(m, bt.peer);
+        fmt_str("OK PAD ok "); fmt_str(m);
         fmt_str(" rep "); fmt_dec(bt.reports);
         return;
     }

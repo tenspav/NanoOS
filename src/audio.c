@@ -4,6 +4,7 @@
 #include "fmt.h"
 #include "asset.h"
 #include "report.h"
+#include "memmap.h"
 /* Codec on SPI port 0 (RetailOS 0x08429fb8 / 0x08429ffe -> 0x083f4ee8
  * port 0, one CS-low transaction; NanoEmu nano7_codec.c):
  *   write  6C msb lsb 00 data      read  6D msb lsb 00 xx -> rx[4]
@@ -54,8 +55,9 @@
 #define SPI_US 10000u           /* per byte (polled spi_xfer) */
 struct lli { uint32_t src, dst, next, cfg, count; };
 struct audio_state audio;
-static int16_t out[2][PASS * 2], hush[HUSH];
-static volatile struct lli d[2];
+/* DMA-read: the uncached kernel .dma (memmap.h) */
+static int16_t out[2][PASS * 2] MM_DMA_BUF, hush[HUSH] MM_DMA_BUF;
+static volatile struct lli d[2] MM_DMA_BUF;
 static const int16_t *pcm;
 static uint32_t frames, acc, rate, stereo;
 static unsigned cur;            /* descriptor playing */

@@ -1,18 +1,19 @@
 CROSS_COMPILE ?= arm-none-eabi-
 CC := $(CROSS_COMPILE)gcc
 OBJCOPY := $(CROSS_COMPILE)objcopy
-# -mno-unaligned-access: with the MMU off all memory is Strongly-ordered,
-# where an unaligned load faults (GCC merges byte loads into ldrh/ldr).
+# -mno-unaligned-access: with the MMU off (NANOOS_MMU=0) all memory is
+# Strongly-ordered, where an unaligned load faults (GCC merges byte loads
+# into ldrh/ldr); with it on, the uncached DMA sections still are.
 CFLAGS := -mcpu=cortex-a5 -marm -O2 -mno-unaligned-access -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-pic -fno-common -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -MMD -MP
-OBJECTS := $(addprefix build/,startup.o main.o lcd.o font.o input.o reset.o devmode.o mem.o timer.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o)
+OBJECTS := $(addprefix build/,startup.o main.o lcd.o font.o input.o reset.o devmode.o mem.o timer.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o mmu.o game.o asset.o)
 # Size: the chainloader package must fit the Blocks.hbapp slot it replaces
 # in the emulator test (20708 bytes, emulator/tools/disk_patch.py). Code
 # off the pixel/bus hot paths is Thumb-2 (-O2: -Os calls libgcc for divisions by constants); lcd, input, timer, font
 # stay ARM -O2 (tuned on the device).
-THUMB_OBJS := $(addprefix build/,main.o devmode.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o)
+THUMB_OBJS := $(addprefix build/,main.o devmode.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o mmu.o game.o asset.o)
 $(THUMB_OBJS): CFLAGS += -mthumb
 # MBX: register pokes and a test page, no divisions: -Os
-build/mbx.o build/mbx_test.o: CFLAGS += -Os
+build/mbx.o build/mbx_test.o build/mmu.o build/game.o build/asset.o: CFLAGS += -Os
 .PHONY: all clean
 all: build/kernel.bin
 build:
