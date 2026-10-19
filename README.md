@@ -1,4 +1,4 @@
-# NanoOS v0.0.3 beta
+# NanoOS v0.0.4 beta
 
 Freestanding ARM kernel for the iPod nano 7G, linked at `0x08000000`, with
 MMU and D-cache enabled (flat 1:1 map; LCD, GPU test buffers, DMA arena and
@@ -19,11 +19,14 @@ USB, Bluetooth HID, and MBX GPU, all verified on the real device:
   ViceNano scene on the device.
 - **Audio** probes the codec and feeds a PCM tone at 44.1 kHz.
 - **USB** reads the OTG core ID.
-- **NAND** (Apple PPN via the FMC at `0x38a00000`) is in bring-up: on most
-  boots the FMC register space is unpowered/unclocked after the RetailOS
-  handoff, so the driver now runs a staged recovery (controller reset,
-  FMC clock enable, PSC power-domain wake, candidate clock gates) and
-  reports which step relatched the block. Refuses flash writes.
+- **NAND** (Apple PPN via the FMC at `0x38a00000`) reads pages on
+  hardware. After the RetailOS handoff the FMC register space is
+  unpowered, so the driver runs a staged recovery (controller reset, FMC
+  clock enable, PSC power-domain wake, candidate clock gates), then
+  performs the RetailOS read sequence (0x0A command, 4-byte address,
+  SET FEATURES power state) with a terminating power-mode poll and a
+  full D-cache clean so reports survive the reboot. Refuses flash
+  writes.
 - **MBX GPU** renders scenes on hardware; see below.
 
 Drivers are polled with bounded waits. These are development interfaces,
@@ -72,7 +75,7 @@ and resource images. Rebuild emulator changes with `emulator/build.sh`.
 
 See [INSTALL_IPOD.md](INSTALL_IPOD.md) for integrated bundle testing,
 device file transfer, and rollback. Emulator validation is continuous;
-hardware validation covers the drivers listed above. Clock stability beyond
-stock profiles and NAND data reads remain under active bring-up.
+hardware validation covers the drivers listed above, including NAND page
+reads. Clock stability beyond stock profiles remains under active bring-up.
 
 NanoOS by Tenspav. Requires the community untethered jailbreak to install.
