@@ -18,6 +18,12 @@ void lcd_center(int y, const char *text, uint32_t color);
  * ARGB8888): a GPU may render into it; it changes at each flip */
 uint32_t *lcd_back(void);
 void lcd_present(void);   /* marks the frame; lcd_service() pushes it */
+/* Optional native portrait scanout from caller-owned uncached game-GPU RAM.
+ * Source must be128-byte aligned;0 accepted,-1 invalid,-2 busy. No CPU copy.
+ * Keep every source byte unchanged until lcd_buffer_busy(range) returns0.
+ * Retries retain the lease. Progress requires lcd_service() calls. */
+int lcd_present_buffer(const uint32_t *source);
+int lcd_buffer_busy(const uint32_t *source,uint32_t bytes);
 void lcd_service(void);   /* call every main-loop pass; never blocks long */
 int lcd_busy(void);       /* a frame is queued, in flight or to be re-sent */
 int lcd_ready(void);      /* the back buffer is free: no frame queued, so

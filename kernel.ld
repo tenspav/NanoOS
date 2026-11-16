@@ -35,9 +35,9 @@ SECTIONS
         __data_end = .;
     } > DRAM
 
-    /* data from 0x08010000 on: NanoEmu's real iPod mode charges uncached
-     * DRAM time there, while code below runs at full speed */
-    ASSERT(. <= 0x08010000, "code/data past 0x08010000")
+    /* Bound code/data growth explicitly. BSS follows on a16KiB boundary;
+     * the kernel/stack still must fit below the framebuffer at0x08200000. */
+    ASSERT(. <= 0x08040000, "code/data past 0x08040000")
     /* Buffers a DMA master or the GPU uses (MM_DMA_BUF, src/memmap.h):
      * their own uncached sections MM_DMA..MM_DMA_END, so the rest of the
      * kernel's 2 MB can be cached (src/mmu.c). Listed before .bss so that
@@ -49,7 +49,7 @@ SECTIONS
         __dma_end = .;
     }
     ASSERT(__dma_end <= 0x08800000, "kernel .dma past MM_DMA_END")
-    .bss 0x08010000 (NOLOAD) : {
+    .bss ALIGN(__data_end, 0x4000) (NOLOAD) : {
         . = ALIGN(4);
         __bss_start = .;
         *(.bss*)

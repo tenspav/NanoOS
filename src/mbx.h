@@ -1,6 +1,8 @@
 #ifndef NANOOS_MBX_H
 #define NANOOS_MBX_H
 #include <stdint.h>
+void mbx_timings(uint32_t out[12]);
+void mbx_submit_parts(const uint32_t *header,uint32_t header_words,const void *vertices,uint32_t vertex_words);
 /* id: core +0xf00 (core ID); rev: +0xf10; sig: +0xff0..+0xffc bytes
  * (0xb105f00d on cores that have it); done_us: scene submit to render
  * done; scenes: completed; status: +0x12c at the end of the last one;
@@ -84,6 +86,19 @@ extern struct mbx_ta_probe mbx_probe, mbx_tafail;
 #ifndef MBX_REARM_PAGES
 #define MBX_REARM_PAGES 60u
 #endif
+/* The current driver recycles parameter pages after completion. Historical
+ * page-touch counts do not measure live allocation. Runs116/117 verify336
+ * mixed-workload and1536indexed-lit frames with no proactive reset, including
+ * per-frame pixel/stability checks. Keep0 only for legacy A/B diagnostics;
+ * overflow/timeout checks and fault handling are unchanged. */
+#ifndef MBX_NO_PROACTIVE_REARM
+#define MBX_NO_PROACTIVE_REARM 1
+#endif
+/* 1 preserves per-word polling.123 reserves the observed FIFO credit, then
+ * writes native-style32word chunks and a tail. No assumed free capacity. */
+#ifndef MBX_FIFO_BURST
+#define MBX_FIFO_BURST 123u
+#endif
 #define MBX_REARM_BIG_SEGS 150u
 #define MBX_REARM_BIG_EVERY 3u
 /* R80 build tag: a report without it came from an older kernel */
@@ -96,7 +111,7 @@ extern struct mbx_ta_probe mbx_probe, mbx_tafail;
 struct mbx_pool_watch {
     uint32_t arms, rearms, used, n, d[8], r838[8], r820[8], dmax, a_why,
              a_used, a_n, a_links, a_idx[4], a_val[4], a_end, w8_max, w8_miss,
-             rearm_n;   /* round 14: re-arms by scene count */
+             rearm_n,scan_enabled; /* page-touch statistics only when enabled */
 };
 extern struct mbx_pool_watch mbx_pw;
 #define MBX_NEVER 0xffffffffu
@@ -227,6 +242,7 @@ const uint32_t *mbx_fifo_log(void);
 const uint32_t *mbx_aux_copy(uint32_t k);
 uint32_t mbx_crc32(const uint32_t *w, uint32_t n); /* IEEE, LE words */
 /* DevMode GPU page (mbx_test.c) */
+void mbx_autorun(void);
 void mbx_test_enter(void);
 void mbx_test_draw(void);
 void mbx_test_key(unsigned keys);  /* Vol+/Vol- (BUTTON_RIGHT/LEFT): variant */
@@ -234,4 +250,7 @@ void mbx_test_leave(void); /* Home from the GPU page: reset a stalled core */
 /* core reset as RetailOS (16 passes) + events acknowledged; mbx_init()
  * before the next scene */
 void mbx_halt(void);
+/* Optional queued ISP with a second owned region buffer; capability0 means unsupported. */
+uint32_t mbx_queue_capacity(void);
+int mbx_render_async(const uint32_t *,uint32_t,uint32_t,uint32_t);
 #endif

@@ -45,4 +45,10 @@
 #define MM_UNCACHED      0xfffffcecu
 /* a zero-initialised buffer that a DMA master or the GPU uses */
 #define MM_DMA_BUF __attribute__((section(".bss.dma")))
+
+/* FIFO Device mapping permits posted writes; all other MMIO stays strongly ordered. */
+#ifndef MM_MBX_FIFO_DEVICE
+#define MM_MBX_FIFO_DEVICE 1
 #endif
+
+#endif /* NANOOS_MEMMAP_H */

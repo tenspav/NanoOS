@@ -7,11 +7,42 @@
  * D-cache is off at startup; DSB publishes owned buffer/table stores. */
 #define CORE(o) (*(volatile uint32_t *)(0x3b000000u + (o)))
 #define TA_FIFO (*(volatile uint32_t *)0x3b800000u)
+#ifndef MBX_FIFO_STM
+#define MBX_FIFO_STM 1
+#endif
+#ifndef MBX_CONTEXT_ALTERNATE
+#define MBX_CONTEXT_ALTERNATE 0
+#endif
+#ifndef MBX_FRAME_PIPELINE
+#define MBX_FRAME_PIPELINE 1
+#endif
+static uint32_t mbx_context_slot,mbx_context_serial;
+uint32_t mbx_pipeline_probe_result[98];
+uint32_t mbx_pipeline_stats[16];
 #define DOORBELL (*(volatile uint32_t *)0x3bc00000u)
 #define RENDER_DONE 0x10u
 #define JOB_DONE 0x44u
 #define OVERFLOW 0x20u
+#if MBX_FRAME_PIPELINE
+static uint32_t async_pending,async_events,async_slot,async_start;
+#define ASYNC_EVENTS (JOB_DONE|0x08u|OVERFLOW)
+#endif
+static inline __attribute__((always_inline)) void ack_bits(uint32_t bits){
+#if MBX_FRAME_PIPELINE
+    if(async_pending){
+        uint32_t events=CORE(0x12c)&ASYNC_EVENTS;async_events|=events;
+        mbx_pipeline_stats[7]+=events!=0;
+        /* Never clear an in-flight ISP event, including one that arrives
+         * between this read and the W1C store. Its waiter owns those bits. */
+        bits&=~ASYNC_EVENTS;
+    }
+#endif
+    CORE(0x134)=bits;
+}
 #define WAIT_US 20000u
+#ifndef MBX_ISP_TIMEOUT_US
+#define MBX_ISP_TIMEOUT_US 500000u
+#endif
 /* TA wait after the EOL: 20 ms timed out with +0x12c = 0 (round 7); wait
  * longer so a slow TA is told apart from a dead one (mbx_fail.ta_max_us) */
 #define WAIT_TA_US 100000u
@@ -19,7 +50,14 @@
 #define NY 27u
 #define GRID (((NY - 1) << 16) | (NX - 1))
 #define PB_BYTES 0x10000u
+#include "mbx_dma_fifo.inc"
 #define SCENE_OFFSET 0x1004u
+static uint32_t scene_timing[12];
+#ifndef MBX_FIFO_PROFILE
+#define MBX_FIFO_PROFILE 0
+#endif
+uint32_t mbx_fifo_profile[6];
+void mbx_timings(uint32_t out[12]){if(out)for(unsigned i=0;i<12;++i)out[i]=scene_timing[i];}
 struct mbx_info mbx;
 struct mbx_dbg mbx_dbg;
 uint32_t mbx_variant;
@@ -85,7 +123,12 @@ static uint32_t pt[8 * 1024] MM_DMA_BUF __attribute__((aligned(4096)));
 /* Reserve more than the observed pointer span, independently of grid size.
  * The scene/region area is embedded in this owned PB allocation. The traced
  * +0x1004 offset is known; allocator sizes/free-list seeds are not. */
+#if MBX_FRAME_PIPELINE
+static uint32_t pb_storage[2][PB_BYTES/4] MM_DMA_BUF __attribute__((aligned(4096)));
+#define pb (pb_storage[mbx_context_slot])
+#else
 static uint32_t pb[PB_BYTES / 4] MM_DMA_BUF __attribute__((aligned(4096)));
+#endif
 #define SCENE_VA MBX_VA((uint8_t *)pb + SCENE_OFFSET)
 static void barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
 /* RetailOS-style global parameter allocator storage (63 pages as RetailOS's
@@ -93,9 +136,17 @@ static void barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
  * template) and the 16 KB allocator workspace behind +0x824. Persistent
  * across frames. 16 pages ran out on hardware (round 6: TA st 00008020,
  * ISP st F2060071 = 0x20 on the last of 113 world segments). */
+#ifndef MBX_LARGE_POOL
+#define MBX_LARGE_POOL 1
+#endif
+#if MBX_LARGE_POOL
+/* RAM-only capacity experiment, entirely kernel-owned DMA storage. */
+#define PARAM_PAGES 700u
+#define PARAM_MAX 700u
+#else
 #define PARAM_PAGES 63u
-/* MBX_V_POOL: 256 pages; one guard page past the exclusive end */
 #define PARAM_MAX 256u
+#endif
 #define PARAM_WORDS ((PARAM_MAX + 2u) * 1024u)
 static uint32_t mbx_param[PARAM_WORDS] MM_DMA_BUF __attribute__((aligned(4096)));
 static uint32_t mbx_param_aux[0x4000u / 4u] MM_DMA_BUF __attribute__((aligned(4096)));
@@ -224,7 +275,8 @@ static uint32_t pool_mark(void) {
 /* a completed scene: its new pages and the allocator registers after it */
 static void pool_scene(void) {
     struct mbx_pool_watch *p = &mbx_pw;
-    uint32_t d = pool_mark(), i = p->n++ % 8u;
+    p->scan_enabled=!MBX_NO_PROACTIVE_REARM||MBX_PROBE||MBX_FIFO_PROFILE||(mbx_variant&MBX_V_DIAG);
+    uint32_t d=p->scan_enabled?pool_mark():0,i=p->n++%8u;
     p->d[i] = d;
     p->r838[i] = CORE(0x838);
     p->r820[i] = CORE(0x820);
@@ -279,7 +331,7 @@ static int identify(void) {
  * delay, with +0x134 = 0xffff acknowledged on each pass. */
 static void reset(uint32_t us, uint32_t passes) {
     for (uint32_t i = 0; i < passes; ++i) {
-        CORE(0x134) = 0xffffu;
+        ack_bits(0xffffu);
         CORE(0x080) = 0x111u;
         barrier();
         delay_us(us);
@@ -289,8 +341,12 @@ static void reset(uint32_t us, uint32_t passes) {
     }
 }
 void mbx_halt(void) {
+#if MBX_FRAME_PIPELINE
+    async_pending=async_events=0;
+#endif
+    fdma_close();
     reset(500u, 16u);
-    CORE(0x134) = 0xffffu;
+    ack_bits(0xffffu);
 }
 static void capture_diag(void) {
     static const uint32_t addr[11] = {
@@ -405,7 +461,7 @@ static int init_parameter_allocator(void) {
     uint32_t va = MBX_VA(mbx_param);
     uint32_t first_page = (va >> 12) + 1u;
     barrier();
-    CORE(0x134) = 0x40u;
+    ack_bits(0x40u);
     mbx_dbg.st[1] = CORE(0x12c);
     CORE(0x824) = MBX_VA(mbx_param_aux);
     mbx_dbg.st[2] = CORE(0x12c);
@@ -427,7 +483,7 @@ static int init_parameter_allocator(void) {
     barrier();
     int ok = wait_any(&CORE(0x12c), 0x40u, WAIT_US) == WAIT_OK;
     ck(MBX_CK_A);
-    CORE(0x134) = 0x40u;
+    ack_bits(0x40u);
     barrier();
     if (!ok) ++mbx.timeouts;
     snap_alloc(0);
@@ -443,7 +499,7 @@ static int init_parameter_allocator(void) {
 static void ev_ack(uint32_t bits) {
     CORE(0x130) = 0;
     barrier();
-    CORE(0x134) = bits;
+    ack_bits(bits);
     barrier();
     CORE(0x130) = 0x8775u;
     barrier();
@@ -458,9 +514,9 @@ static void ctx_init(void) {
     uint32_t st, spins = 0, t0;
     mbx_dbg.ctx_pre[0] = CORE(0x12c);
     for (uint32_t i = 0; i < 4; ++i) mbx_dbg.ctx_pre[1 + i] = CORE(reg[i]);
-    CORE(0x134) = 0x100u;
+    ack_bits(0x100u);
     barrier();
-    CORE(0x810) = 0;
+    CORE(0x810) = mbx_context_slot;
     barrier();
     t0 = USEC;
     CORE(0x81c) = 1;
@@ -527,6 +583,7 @@ static const uint32_t *template_words(void) {
     return initial;
 }
 static int core_init(void) {
+    mbx_context_slot=mbx_context_serial=0;
     t_init = USEC;
     mbx_diag[11] = CLK(0x68);
     mbx_diag[12] = CLK(0x58);
@@ -547,7 +604,7 @@ static int core_init(void) {
     for (uint32_t i = 0; i < 4; ++i) mbx_dbg.va[i] = MBX_VA(mbx_dbg.pa[i]);
     if (!ok) { capture_diag(); return 0; }
     CORE(0x85c) = 0x80u;
-    CORE(0x134) = 0xffffu;
+    ack_bits(0xffffu);
     /* RetailOS enable mask; no CPU IRQ handler is installed, so +0x12c
      * (raw status) is still polled. */
     CORE(0x130) = 0x8775u;
@@ -591,9 +648,23 @@ static int core_init(void) {
     pfx_pending = 1;
     return 1;
 }
+#include "mbx_dma_probe.inc"
 int mbx_init(void) {
+    mbx_context_slot=mbx_context_serial=0;
+    mbx_pipeline_probe_result[0]=MBX_CONTEXT_ALTERNATE;
+    for(unsigned i=0;i<16;++i)mbx_pipeline_stats[i]=0;
+    mbx_pipeline_stats[0]=MBX_FRAME_PIPELINE;
+#if MBX_FRAME_PIPELINE
+    async_pending=async_events=0;
+    mbx_pipeline_stats[12]=MBX_VA(pb_storage[0]);mbx_pipeline_stats[13]=MBX_VA(pb_storage[1]);mbx_pipeline_stats[14]=PARAM_PAGES;
+#endif
+    mbx_dma_probe_result[0]=MBX_DMA_PROBE;
+    mbx_dma_matrix_result[0]=MBX_DMA_MATRIX;
+#if MBX_DMA_PROBE
+    if(!mbx_fail.inits)run_mbx_dma_probe();
+#endif
     ++mbx_fail.inits;
-    return core_init();
+    int rc=core_init();if(rc)fdma_open();return rc;
 }
 /* Round 13: no RetailOS write returns pages between scenes (traces: only
  * the 0x0c/0x40 acks and the 810/81c select, which NanoOS does too), yet the
@@ -615,6 +686,7 @@ int mbx_init(void) {
  * last one had more than MBX_REARM_BIG_SEGS segments. Triangle/quad/preview
  * scenes keep the six-scene count. */
 static int pool_low(void) {
+    if(MBX_NO_PROACTIVE_REARM)return 0;
     struct mbx_pool_watch *p = &mbx_pw;
     if ((mbx_variant & MBX_V_DIAG) || pfx_pending || !p->n) return 0;
     uint32_t d = p->d[(p->n - 1u) % 8u];
@@ -625,7 +697,7 @@ static int pool_low(void) {
 }
 /* RetailOS ISP list, all pairs before the +0x680 kick */
 static void isp_list(const uint32_t *target, uint32_t w, uint32_t h, uint32_t stride) {
-    CORE(0x6ec) = 0;
+    CORE(0x6ec) = mbx_context_slot;
     CORE(0x608) = SCENE_VA;
     CORE(0x610) = 0x00030000u;
     CORE(0x614) = 0x1e3ce508u;
@@ -657,19 +729,41 @@ void mbx_set_target(const uint32_t *target, uint32_t w, uint32_t h, uint32_t str
 static void submit_rec(const uint32_t *fifo, uint32_t words, uint32_t c, int bell);
 static void fail(uint32_t reason);
 __attribute__((noinline)) void mbx_begin(void) {
+    uint32_t profile_start=USEC;
+#if MBX_FIFO_DMA
+    fdma_ready=0;
+#endif
+    for(unsigned i=0;i<12;++i)scene_timing[i]=0;
     int rearm_bad = 0;
     if (pool_low()) {
+#if MBX_FRAME_PIPELINE
+        /* A legacy recovery policy may still request a re-arm. It must not
+         * reset shared parameters while the previous ISP owns them. */
+        if(async_pending&&mbx_wait_done(MBX_ISP_TIMEOUT_US))rearm_bad=1;
+#endif
+        scene_timing[11]=1;
         ++mbx_pw.rearms;
         aux_evidence(1);
-        rearm_bad = !core_init();
+        if(!rearm_bad)rearm_bad = !core_init();
     }
     t_begin = t_scene = USEC;
     t_eol = 0;
     scene_failed = 0;
+    for(unsigned i=0;i<6;++i)mbx_fifo_profile[i]=0;
     fail_reason = 0;
     job_result = -1;
     scene_words = 0;
     ++mbx_fail.scene;
+#if MBX_CONTEXT_ALTERNATE || MBX_FRAME_PIPELINE
+    mbx_context_slot=mbx_context_serial++&1u;
+#endif
+#if MBX_FRAME_PIPELINE
+    if(async_pending){
+        ++mbx_pipeline_stats[3];
+        if(((CORE(0x12c)|async_events)&JOB_DONE)!=JOB_DONE)++mbx_pipeline_stats[4];
+        if(mbx_context_slot==async_slot){++mbx_pipeline_stats[9];if(mbx_wait_done(MBX_ISP_TIMEOUT_US)){fail(15);return;}}
+    }
+#endif
     mbx.ta_status = mbx.job_status = 0;
     scene_pre = CORE(0x12c);
     {   /* round 12 probe: new scene (ring, gap, clock gates at begin) */
@@ -688,8 +782,9 @@ __attribute__((noinline)) void mbx_begin(void) {
         fail(12);
         return;
     }
-    CORE(0x134) = 0xffffu;
-    init_buffers();
+    ack_bits(0xffffu);
+    uint32_t buffer_start=USEC;init_buffers();scene_timing[9]=USEC-buffer_start;
+    uint32_t context_start=USEC;
     if (mbx_variant & MBX_V_ISP && isp_target) {
         isp_list(isp_target, isp_w, isp_h, isp_stride);
         barrier();
@@ -729,8 +824,8 @@ __attribute__((noinline)) void mbx_begin(void) {
     mbx_dbg.r85c = CORE(0x85c);
     CORE(0x840) = MBX_VA(pb);
     CORE(0x844) = SCENE_VA;
-    CORE(0x84c) = 240u << 16;
-    CORE(0x850) = 432u << 16;
+    CORE(0x84c) = (isp_target ? isp_w : 240u) << 16;
+    CORE(0x850) = (isp_target ? isp_h : 432u) << 16;
     CORE(0x854) = 0x3727c5acu;
     if (mbx_variant & MBX_V_DIAG) mbx_dbg.rb_w[0] = CORE(0x854);
     CORE(0x858) = 0x3727c5acu;
@@ -750,6 +845,10 @@ __attribute__((noinline)) void mbx_begin(void) {
     barrier();
     ck(MBX_CK_800);
     trk(CORE(0x12c));            /* round 15: status after the 800 kick */
+#if MBX_FIFO_DMA
+    fdma_begin();
+#endif
+    scene_timing[10]=USEC-context_start;scene_timing[0]=USEC-profile_start;
 }
 /* failure snapshot (mbx_fail), taken once per failed scene */
 static void snap_fail(uint32_t reason, uint32_t st) {
@@ -814,7 +913,15 @@ static void fail(uint32_t reason) {
     scene_failed = 1;
 }
 /* USEC is read only once the FIFO is found full (the timeout start) */
-static int fifo_word(uint32_t word) {
+static int fifo_room(void) {
+#if MM_MBX_FIFO_DEVICE
+    /* FIFO and status are separate peripheral blocks. Drain posted writes
+     * before observing occupancy; packet-end DSB still precedes the bell. */
+    barrier();
+#endif
+#if MBX_FIFO_PROFILE
+    ++mbx_fifo_profile[5];
+#endif
     uint32_t start = 0;
     for (uint32_t spins = 0; spins < WAIT_US * 64u; ++spins) {
         mbx.status = CORE(0x12c);
@@ -822,9 +929,16 @@ static int fifo_word(uint32_t word) {
         if (mbx.status & OVERFLOW) { fail(2); return -1; }
         uint32_t occ = (mbx.status >> 16) & 0xffu;
         if (mbx_variant & MBX_V_DIAG && occ > mbx_dbg.fifo_max) mbx_dbg.fifo_max = occ;
+        #if MBX_FIFO_PROFILE
+        ++mbx_fifo_profile[0];mbx_fifo_profile[1]+=occ>=123u;
+        if(occ>mbx_fifo_profile[2])mbx_fifo_profile[2]=occ;
+        mbx_fifo_profile[3]+=occ;
+#endif
         if (occ < 0x7bu) {
-            TA_FIFO = word;
-            return 0;
+#if MBX_FIFO_PROFILE
+            if(spins)mbx_fifo_profile[4]+=USEC-start;
+#endif
+            return (int)(0x7bu-occ);
         }
         if (!spins) start = USEC;
         else if (USEC - start >= WAIT_US) break;
@@ -833,11 +947,14 @@ static int fifo_word(uint32_t word) {
     fail(3);
     return -1;
 }
+static int fifo_word(uint32_t word){if(fifo_room()<0)return -1;TA_FIFO=word;return 0;}
 /* MBX_V_DIAG: every FIFO0 word as stored */
 static uint32_t fifo_log[MBX_LOG_WORDS];
 /* returns the words stored */
+typedef uint32_t mbx_fifo_word __attribute__((may_alias));
 static uint32_t submit(const uint32_t *fifo, uint32_t words, int bell) {
-    uint32_t log = mbx_variant & MBX_V_DIAG, i;
+    const mbx_fifo_word *data=(const mbx_fifo_word *)fifo;
+    uint32_t log = mbx_variant & MBX_V_DIAG, i=0;
     if (scene_failed) return 0;
 #if MBX_PROBE
     if (t_sub && USEC - t_sub > mbx_probe.gap_max_us) {
@@ -845,9 +962,59 @@ static uint32_t submit(const uint32_t *fifo, uint32_t words, int bell) {
         mbx_probe.gap_seg = seg_n;
     }
 #endif
+#if !MBX_PROBE && MBX_FIFO_BURST > 1
+    if(!log){
+        /* RetailOS computes (123-occupancy)*4 available bytes and its writer
+         * emits at most32words per group. NanoOS is the sole FIFO writer.
+         * GPU consumption can only increase space during this bounded group.
+         * Keep the existing per-segment doorbell below, including EOL order. */
+        while(i<words){
+            int room=fifo_room();if(room<0){scene_words+=i;return i;}
+            uint32_t count=words-i;if(count>(uint32_t)room)count=(uint32_t)room;
+            if(count>MBX_FIFO_BURST)count=MBX_FIFO_BURST;
+#if MBX_FIFO_DMA
+            if(fdma_ready&&count>=32u){
+                if(fdma_span(data+i,count)){scene_words+=i;fail(14);return i;}
+                i+=count;continue;
+            }
+#endif
+            /* Match the native 32-word writer without a per-word branch. The
+             * reserved room still bounds this whole group; every store targets
+             * the same FIFO port, and the packet keeps its original doorbell. */
+            uint32_t copied=0;
+#if MBX_FIFO_STM
+            /* Sequential aperture stores. Physical runs163/166 validate
+             * incrementing32-bit FIFO accesses for capacity-reserved groups.
+             * Restart at the base for each8word group; never cross0x1c.
+             * Device mapping and the existing DSB/credit/bell rules remain. */
+            for(;count-copied>=8u;copied+=8u){
+                const mbx_fifo_word *src=data+i+copied;
+                __asm__ volatile("ldmia %0!, {r2-r9}\n\tstmia %1, {r2-r9}"
+                    : "+&r"(src) : "r"(0x3b800000u)
+                    : "r2","r3","r4","r5","r6","r7","r8","r9","memory");
+            }
+#else
+            for(;count-copied>=32u;copied+=32u){const mbx_fifo_word *src=data+i+copied;
+#define FIFO_COPY(j) TA_FIFO=src[j]
+                FIFO_COPY(0);FIFO_COPY(1);FIFO_COPY(2);FIFO_COPY(3);
+                FIFO_COPY(4);FIFO_COPY(5);FIFO_COPY(6);FIFO_COPY(7);
+                FIFO_COPY(8);FIFO_COPY(9);FIFO_COPY(10);FIFO_COPY(11);
+                FIFO_COPY(12);FIFO_COPY(13);FIFO_COPY(14);FIFO_COPY(15);
+                FIFO_COPY(16);FIFO_COPY(17);FIFO_COPY(18);FIFO_COPY(19);
+                FIFO_COPY(20);FIFO_COPY(21);FIFO_COPY(22);FIFO_COPY(23);
+                FIFO_COPY(24);FIFO_COPY(25);FIFO_COPY(26);FIFO_COPY(27);
+                FIFO_COPY(28);FIFO_COPY(29);FIFO_COPY(30);FIFO_COPY(31);
+#undef FIFO_COPY
+            }
+#endif
+            for(;copied<count;++copied)TA_FIFO=data[i+copied];
+            i+=count;
+        }
+    }else
+#endif
     for (i = 0; i < words; ++i) {
-        if (fifo_word(fifo[i])) { scene_words += i; return i; }
-        if (log && mbx_dbg.log_n < MBX_LOG_WORDS) fifo_log[mbx_dbg.log_n++] = fifo[i];
+        if (fifo_word(data[i])) { scene_words += i; return i; }
+        if (log && mbx_dbg.log_n < MBX_LOG_WORDS) fifo_log[mbx_dbg.log_n++] = data[i];
     }
     scene_words += i;
     barrier();
@@ -880,13 +1047,28 @@ static void flush_bell(void) {
     if (mbx_variant & MBX_V_DIAG) ++mbx_dbg.bells;
     barrier();
 }
-void mbx_submit(const uint32_t *fifo, uint32_t words) {
+static void submit_runtime(const uint32_t *fifo, uint32_t words) {
     int bell = !MBX_BELL_BATCH || seg_n < BELL_SEGS;
     ++seg_n;
     if (bell) { submit_rec(fifo, words, MBX_CK_N, 1); return; }
     submit_rec(fifo, words, MBX_CK_N, 0);
     pend_words += words;
     if (pend_words >= BELL_BATCH) flush_bell();
+}
+void mbx_submit(const uint32_t *fifo,uint32_t words){uint32_t start=USEC;submit_runtime(fifo,words);scene_timing[1]+=USEC-start;}
+/* Two immediate spans, one primitive packet and one terminating doorbell.
+ * A static interleaved GLES2 vertex array can be streamed without copying it
+ * into the command segment. Neither span outlives this call. */
+void mbx_submit_parts(const uint32_t *header,uint32_t nh,const void *vertices,uint32_t nv){
+    uint32_t start=USEC;
+    if((nh&&!header)||(nv&&!vertices)||((uintptr_t)header&3u)||((uintptr_t)vertices&3u)||nh>UINT32_MAX-nv){fail(13);return;}
+    flush_bell();++seg_n;
+    submit_rec(header,nh,MBX_CK_N,0);
+    if(!scene_failed)submit_rec((const uint32_t *)vertices,nv,MBX_CK_N,1);
+#if MBX_FRAME_PIPELINE
+    if(async_pending&&((CORE(0x12c)|async_events)&JOB_DONE)!=JOB_DONE)++mbx_pipeline_stats[15];
+#endif
+    scene_timing[1]+=USEC-start;
 }
 const uint32_t *mbx_fifo_log(void) { return fifo_log; }
 /* Overflow takes precedence over completion. Bound every poll even if the
@@ -911,6 +1093,8 @@ static int wait_status(uint32_t bits, uint32_t us, uint32_t *n, uint32_t *took,
         }
     }
     *took = USEC - t_scene;
+    if(bits==JOB_DONE)scene_timing[5]=USEC-start;
+    uint32_t extra_start=USEC;
     if (!r && extra && (mbx.status & extra) != extra) {
         uint32_t t0 = USEC, w = MBX_NEVER;
         for (spins = 0; spins < MBX_W8_US * 64u && USEC - t0 < MBX_W8_US; ++spins)
@@ -918,9 +1102,10 @@ static int wait_status(uint32_t bits, uint32_t us, uint32_t *n, uint32_t *took,
         if (w == MBX_NEVER) { ++mbx_fail.no8; ++mbx_pw.w8_miss; }
         else if (w > mbx_pw.w8_max) mbx_pw.w8_max = w;
     }
+    if(bits==JOB_DONE)scene_timing[6]=USEC-extra_start;
     /* job done: RetailOS's ISR acks 0x0c, then 0x40 (trace #723/#724) */
-    if (extra) { CORE(0x134) = 0x0cu; CORE(0x134) = 0x40u; }
-    CORE(0x134) = 0xffffu;
+    if (extra) { ack_bits(0x0cu); ack_bits(0x40u); }
+    ack_bits(0xffffu);
     barrier();
     return r;
 }
@@ -948,7 +1133,7 @@ static int end_scene(void) {
     wake();
     t_eol = USEC;
     int r = wait_status(RENDER_DONE, WAIT_TA_US, &mbx.scenes, &mbx.done_us, 0);
-    uint32_t ta = USEC - t_eol;
+    uint32_t ta = USEC - t_eol;scene_timing[2]=ta;
     mbx.ta_status = mbx.status;
     ck_st(MBX_CK_T, mbx.status);
     if (r) {
@@ -997,6 +1182,7 @@ static void snap_regions(uint32_t k) {
 }
 /* RSN 9 (round 11): the ISP job did not end in 20 ms. Keep reading +0x12c
  * (no writes: the MMIO sequence is unchanged) to see whether it ends late. */
+#if !MBX_FRAME_PIPELINE
 static void isp_late_watch(void) {
     uint32_t st = 0, t0 = USEC;
     mbx_fail.isp_late_us = MBX_NEVER;
@@ -1007,6 +1193,7 @@ static void isp_late_watch(void) {
     }
     mbx_fail.isp_late_st = st;
 }
+#endif
 const char *mbx_fail_text(uint32_t reason) {
     switch (reason) {
     case 2: return "GPU overflow (0x20) while sending";
@@ -1017,10 +1204,16 @@ const char *mbx_fail_text(uint32_t reason) {
     case 10: return "overflow (0x20) while waiting TA";
     case 11: return "overflow (0x20) while waiting ISP";
     case 12: return "pool re-arm (GPU re-init) failed";
+    case 13: return "invalid split command spans";
+    case 14: return "FIFO DMA transfer failed";
     default: return "unknown reason";
     }
 }
-int mbx_render(const uint32_t *target, uint32_t w, uint32_t h, uint32_t stride) {
+static int render_start(const uint32_t *target, uint32_t w, uint32_t h, uint32_t stride) {
+#if MBX_FRAME_PIPELINE
+    if(async_pending&&mbx_wait_done(MBX_ISP_TIMEOUT_US))return -1;
+#endif
+    uint32_t render_start=USEC;
     job_result = -1;
     int ta = end_scene();
     if (mbx_variant & MBX_V_DIAG) {
@@ -1035,21 +1228,31 @@ int mbx_render(const uint32_t *target, uint32_t w, uint32_t h, uint32_t stride) 
     if (ta) return -1;
     /* RetailOS finalizes the region records after TA completion and before
      * the ISP list is applied, not before the TA starts. */
+    uint32_t region_start=USEC;
     for (uint32_t i = 0; i < 810 && SCENE_OFFSET + 8 * i + 8 <= PB_BYTES; ++i)
         pb[(SCENE_OFFSET + 8 * i) / 4] |= i == 809 ? 0xc0000000u : 0x40000000u;
-    barrier();
+    barrier();scene_timing[3]=USEC-region_start;
+    uint32_t setup_start=USEC;
     isp_list(target, w, h, stride);
     mbx_dbg.r60c = CORE(0x60c);
     barrier();
+    scene_timing[4]=USEC-setup_start;
     t_scene = USEC;
+#if MBX_FRAME_PIPELINE
+    async_events=0;async_slot=mbx_context_slot;async_start=USEC;async_pending=1;
+    ++mbx_pipeline_stats[1];
+#endif
     CORE(0x680) = 1;             /* final pair: ordinary ISP launch */
     barrier();
-    job_result = wait_status(JOB_DONE, WAIT_US, &mbx.jobs, &mbx.job_us, 0x08u);
+#if MBX_FRAME_PIPELINE
+    scene_timing[8]=USEC-render_start;return 0;
+#else
+    job_result = wait_status(JOB_DONE, MBX_ISP_TIMEOUT_US, &mbx.jobs, &mbx.job_us, 0x08u);
     mbx.job_status = mbx.status;
     if (job_result) {
         snap_fail(mbx.status & OVERFLOW ? 11u : 9u, mbx.status);
         if (mbx_fail.reason == 9u) isp_late_watch();
-    } else pool_scene();
+    } else {uint32_t scan_start=USEC;pool_scene();scene_timing[7]=USEC-scan_start;}
     if (mbx_variant & MBX_V_DIAG) {
         ck_st(MBX_CK_I, mbx.status);
         snap_regions(1);
@@ -1060,13 +1263,88 @@ int mbx_render(const uint32_t *target, uint32_t w, uint32_t h, uint32_t stride) 
         mbx_dbg.rb_i[1] = CORE(0x60c);
     }
     snap_alloc(1);
+#if MBX_CONTEXT_ALTERNATE
+    if(!job_result&&mbx_pipeline_probe_result[1]<16u){
+        uint32_t *r=mbx_pipeline_probe_result+2+6*mbx_pipeline_probe_result[1]++;
+        r[0]=mbx_context_slot;r[1]=CORE(0x810);r[2]=CORE(0x6ec);
+        r[3]=mbx_pool_pages_used();r[4]=CORE(0x838);r[5]=CORE(0x820);
+    }
+#endif
+    scene_timing[8]=USEC-render_start;
     return job_result;
+#endif
+}
+uint32_t mbx_queue_capacity(void){return MBX_FRAME_PIPELINE?1u:0u;}
+int mbx_render_async(const uint32_t *t,uint32_t w,uint32_t h,uint32_t stride){
+#if MBX_FRAME_PIPELINE
+    if(mbx_variant&MBX_V_DIAG)return -2; /* per-scene snapshots require synchronous ownership */
+    return render_start(t,w,h,stride);
+#else
+    (void)t;(void)w;(void)h;(void)stride;return -2;
+#endif
+}
+int mbx_render(const uint32_t *t,uint32_t w,uint32_t h,uint32_t stride){
+#if MBX_FRAME_PIPELINE
+    uint32_t start=USEC;
+#endif
+    int rc=render_start(t,w,h,stride);
+#if MBX_FRAME_PIPELINE
+    if(!rc)rc=mbx_wait_done(MBX_ISP_TIMEOUT_US);
+    scene_timing[8]=USEC-start;
+#endif
+    return rc;
 }
 int mbx_wait_done(uint32_t timeout_us) {
+#if MBX_FRAME_PIPELINE
+    if(!async_pending)return job_result;
+    if(!timeout_us||timeout_us>MBX_ISP_TIMEOUT_US)timeout_us=MBX_ISP_TIMEOUT_US;
+    uint32_t start=USEC,st=0;int rc=-1;
+    for(uint32_t spins=0;spins<timeout_us*64u;++spins){
+        st=CORE(0x12c)|async_events;
+        if(st&OVERFLOW)break;
+        if((st&JOB_DONE)==JOB_DONE){rc=0;break;}
+        if(USEC-start>=timeout_us)break;
+    }
+    scene_timing[5]=USEC-start;
+    mbx_pipeline_stats[8]+=scene_timing[5];++mbx_pipeline_stats[2];
+    uint32_t extra_start=USEC;
+    if(!rc&&!(st&8u)){
+        uint32_t wait=MBX_NEVER;
+        for(uint32_t spins=0;spins<MBX_W8_US*64u&&USEC-extra_start<MBX_W8_US;++spins){
+            uint32_t now=CORE(0x12c);st|=now&ASYNC_EVENTS;
+            if(now&8u){wait=USEC-extra_start;break;}
+        }
+        if(wait==MBX_NEVER){++mbx_fail.no8;++mbx_pw.w8_miss;}
+        else if(wait>mbx_pw.w8_max)mbx_pw.w8_max=wait;
+    }
+    scene_timing[6]=USEC-extra_start;
+    if(st&OVERFLOW)rc=-1;
+    mbx_pipeline_stats[5]=USEC-async_start;
+    if(mbx_pipeline_stats[5]>mbx_pipeline_stats[6])mbx_pipeline_stats[6]=mbx_pipeline_stats[5];
+    mbx_pipeline_stats[11]|=1u<<async_slot;
+    mbx.status=mbx.job_status=st;mbx.job_us=USEC-async_start;job_result=rc;
+    async_pending=0;async_events=0;
+    /* Only the collected ISP events. A new TA/context event belongs to its
+     * own waiter and must survive this completion. */
+    ack_bits(0x0cu);ack_bits(0x40u);barrier();
+    if(rc){++mbx_pipeline_stats[10];++mbx.timeouts;snap_fail(st&OVERFLOW?11u:9u,st);}
+    else{
+        ++mbx.jobs;uint32_t scan=USEC;pool_scene();scene_timing[7]=USEC-scan;
+        if(mbx_context_slot==async_slot){
+            if(mbx_variant&MBX_V_DIAG){
+                ck_st(MBX_CK_I,mbx.status);snap_regions(1);snap_aux(2);snap_table(1);snap_pool(2,template_words());
+                mbx_dbg.rb_i[0]=CORE(0x608);mbx_dbg.rb_i[1]=CORE(0x60c);
+            }
+            snap_alloc(1);
+        }
+    }
+    return rc;
+#else
     /* mbx_render has already waited and acknowledged completion. Preserve
      * the existing render/wait API without waiting again or double counting. */
     (void)timeout_us;
     return job_result;
+#endif
 }
 void mbx_set_background(uint32_t word) { background = word; }
 uint32_t mbx_pb_word(uint32_t byte_off) { return pb[byte_off / 4]; }
@@ -1095,7 +1373,7 @@ uint32_t mbx_aux_links(void) {
     return n;
 }
 int mbx_gpu_page(uint32_t a) {
-    return (a - (uint32_t)pt < sizeof pt) || (a - (uint32_t)mbx_param < sizeof mbx_param) ||
+    return (a - (uint32_t)pt < sizeof pt) || (a - (uint32_t)mbx_param < PARAM_WORDS * sizeof(uint32_t)) ||
            (a - (uint32_t)mbx_param_aux < sizeof mbx_param_aux);
 }
 uint32_t mbx_f32(int v) {

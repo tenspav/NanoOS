@@ -172,10 +172,17 @@ void kernel_main(void) {
     /* first: the game chunks in high DRAM are only intact until NanoOS
      * writes there (memmap.h) */
     mmu_init();
-    apps += game_boot();
+    int game_ready = game_boot();
+    apps += game_ready;
     lcd_init();
     input_init();
     touch_start();
+    /* A valid separate game image is an explicit loader request. Run it
+     * instead of the lab suite, then return through the normal chainloader
+     * reset. Without a game image, preserve unattended hardware validation. */
+    if (game_ready) { game_run(); reset_stockos(); }
+    mbx_autorun();
+    reset_stockos();
     clock_selector(profile);
     for (;;) {
         /* Input every pass: lcd_service() only does a bounded slice of a

@@ -4,6 +4,7 @@
 #if NANOOS_MMU
 /* short-descriptor sections, domain 0, AP=11 (TEX remap off): */
 #define SEC_WB 0x1c0eu   /* Normal, inner/outer write-back write-allocate */
+#define SEC_DEVICE 0x0c06u /* Device, bufferable, uncached; exact accesses */
 #define SEC_SO 0x0c02u   /* Strongly-ordered */
 #define SEC_XN 0x10u
 static uint32_t ttb[4096] __attribute__((aligned(16384)));
@@ -29,6 +30,9 @@ void mmu_init(void) {
         uint32_t s = i - (MM_DRAM >> 20), d = SEC_SO;
         if (s < 64) d = s < 32 && (MM_UNCACHED >> s & 1) ? SEC_SO : SEC_WB;
         else if (i >= 0x380) d = SEC_SO | SEC_XN;   /* MMIO 0x38000000.. */
+        #if MM_MBX_FIFO_DEVICE
+        if(i==0x3b8u)d=SEC_DEVICE|SEC_XN;
+#endif
         ttb[i] = i << 20 | d;
     }
     dcache_clean_all();   /* no line may be valid when C goes on */

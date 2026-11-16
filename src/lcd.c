@@ -1,6 +1,10 @@
 #include "lcd.h"
 #include "timer.h"
 #include "trace.h"
+#include "memmap.h"
+#if (MM_UNCACHED & 0xfffffc00u) != 0xfffffc00u
+#error External scanout requires uncached game-GPU storage
+#endif
 #define REG(o) (*(volatile uint32_t *)(0x38900000u + (o)))
 #define BRIDGE(o) (*(volatile uint32_t *)(0x38300000u + (o)))
 #define DSI(o) (*(volatile uint32_t *)(0x3d800000u + (o)))
@@ -114,6 +118,25 @@ struct lcd_stats lcd_stats;
 enum { IDLE, WAIT_IDLE = 2, WIN_COL, WIN_PAGE, MEMWRITE, BUSY_RISE,
        BUSY_FALL, SETTLE };         /* numbers as shown by DevMode "st" */
 static unsigned state = IDLE, dirty, retry, polls;
+static const uint32_t *external_pending,*external_front;
+static int source_overlap(uintptr_t p,uint32_t bytes,const uint32_t *source){
+    uintptr_t s=(uintptr_t)source;
+    return source&&bytes&&(p>=s?p-s<FB_WORDS*4u:s-p<bytes);
+}
+/* External sources are uncached game-GPU memory, native240x432 ARGB8888.
+ * Acceptance reserves the source; no copy or private back-buffer flip. */
+COLD int lcd_present_buffer(const uint32_t *source){
+    uintptr_t p=(uintptr_t)source;
+    if((p&127u)||p<MM_GAME_GPU||p>MM_GAME_GPU_END-FB_WORDS*4u)return -1;
+    if(dirty||retry||external_pending||state!=IDLE)return -2;
+    __asm__ volatile("dsb sy" ::: "memory");external_pending=source;return 0;
+}
+COLD int lcd_buffer_busy(const uint32_t *source,uint32_t bytes){
+    uintptr_t p=(uintptr_t)source;
+    if(source_overlap(p,bytes,external_pending))return 1;
+    if(source_overlap(p,bytes,external_front))return state!=IDLE||retry||(BRIDGE(0x8c)&3u);
+    return 0;
+}
 static unsigned expired_run;        /* failed waits in a row */
 #define RECOVER_AFTER 3u
 static uint32_t t0, flipped, sent;   /* sent: DCS 0x2c went out */
@@ -176,17 +199,23 @@ COLD void lcd_service(void) {
     for (;;) {
         switch (state) {
         case IDLE:
-            if (!dirty && !retry) return;
+            if (!dirty && !retry && !external_pending) return;
             enter(WAIT_IDLE);
             break;
         case WAIT_IDLE:                     /* previous push done, bridge idle */
             if (!ok(check(&BRIDGE(0x8c), 3, 0, 0, 50000))) return;
-            if (dirty) {
+            if (external_pending) {
+                __asm__ volatile("dsb sy" ::: "memory");
+                external_front=external_pending;external_pending=0;
+                REG(0x24)=(uint32_t)external_front;
+                flipped=lcd_stats.flipped=USEC;trace(1);
+            } else if (dirty) {
                 /* the drawn frame becomes the scan-out, drawing moves on
                  * to the old front buffer, sent and no longer read */
                 dirty = 0;
                 __asm__ volatile("dsb sy" ::: "memory");
                 REG(0x24) = (uint32_t)fb;
+                external_front=0;
                 fb = (uint32_t *)((uint32_t)fb == BUF0 ? BUF1 : BUF0);
                 flipped = lcd_stats.flipped = USEC; trace(1);
             }
@@ -244,10 +273,10 @@ COLD void lcd_service(void) {
         }
     }
 }
-int lcd_busy(void) { return dirty || retry || state != IDLE; }
-int lcd_ready(void) { return !dirty; }
+int lcd_busy(void) { return dirty || retry || external_pending || state != IDLE; }
+int lcd_ready(void) { return !dirty&&!external_pending; }
 uint32_t *lcd_back(void) { return fb; }
-void lcd_present(void) { dirty = 1; }
+void lcd_present(void) { if(!external_pending)dirty = 1; }
 /* Present and wait for the push to finish (before a reset or the like). */
 #define FLUSH_US 200000u   /* > the longest push: 4 waits of 50 ms */
 COLD void lcd_flush(void) {

@@ -23,6 +23,11 @@
 #endif
 #define W 240            /* portrait render target */
 #define H 432
+#include "custom_vgp.h"
+#include "scene_cube.h"
+#include "gl2rt.h"
+#include "gl2rt_data.h"
+#include "gl2objectsmoke.h"
 #define LW LCD_WIDTH     /* landscape LCD, 432x240 */
 #define LH LCD_HEIGHT
 /* RetailOS command format: header 0x10000073, ISP (ONE/ZERO blend,
@@ -157,6 +162,9 @@ static void d1_build(void) {
 #define G_S3 8u
 #define G_TRI 16u
 #define G_D1 32u
+#define G_CV 128u
+#define G_CV1 256u
+#define G_CV2 512u
 #define SEG_P 6u         /* the prefix, recorded by the first mbx_begin() */
 static const uint32_t *const seg_src[7] = { s0, s1, s2, s3, &tri.hdr, d1, mbx_prefix };
 static const uint16_t seg_len[7] = { 20, 20, 17, 381, sizeof tri / 4, 394, 210 };
@@ -173,7 +181,7 @@ static const char seg_name[7][3] = { "S0", "S1", "S2", "S3", "TR", "D1", "P" };
 #define NVAR 4u
 #define R5 (G_S0 | G_S1 | G_S2 | G_TRI)
 #define R5F (MBX_V_85C | MBX_V_NOBELL | MBX_V_CTX)
-static const struct { uint8_t id, segs; uint16_t flags; char desc[24]; } var[NVAR] = {
+static const struct { uint8_t id; uint16_t segs; uint16_t flags; char desc[24]; } var[NVAR] = {
     { 50, R5, R5F, "BASELINE" },
     { 51, R5, R5F | MBX_V_PFX, "PREFIX" },
     { 52, R5, R5F | MBX_V_PFX | MBX_V_860, "PREFIX+860FIX" },
@@ -370,7 +378,7 @@ static void run(void) {
 #endif
         mbx_begin();
         for (uint32_t i = 0; i < 6; ++i)
-            if (var[variant].segs & 1u << i) {
+            if (i != SEG_P && (var[variant].segs & 1u << i)) {
 #if MBX_DIAG_PAGES
                 if (n < MBX_SEGS) s_idx[n++] = i;
 #endif
@@ -864,4 +872,225 @@ void mbx_test_draw(void) {
     fmt_line(4, 226, WHITE);
 #endif
     lcd_present();
+}
+
+/* ---- unattended hardware self-test: every cv_ table entry, one fresh scene each, report to the RAM
+ * mailbox (read back by the loader app after the return to RetailOS) and on screen ---- */
+#include "report.h"
+#ifndef NANOOS_AUTORUN
+#define NANOOS_AUTORUN 1
+#endif
+static char auto_rep[16384];
+static const uint32_t cube_dclr[17] = {0x10000073u,0x22207f80u,0xe0000000u,0x2003801au,0x3u,0u,0x40000000u,0xb00b0800u,0u,0u,0x3f800000u,0x43f00000u,0u,0x3f800000u,0u,0x44580000u,0x3f800000u};
+static void auto_hex(uint32_t v, unsigned n) { fmt_hex(v, n); }
+
+/* cube model-view-projection (column-major) computed on the device: Ry(a) Rx(b) scaled 0.8, translate z=-5, perspective (fov 60deg, aspect 240/432, near 1 far 10).
+ * sin/cos by table lookup with linear interpolation (64 entries/turn); flip=1 negates clip x,y (180-degree image rotation). Mirrors gles2shim/gen_cube.py matrix(). */
+static float cube_trig(float turns, int cosine) {
+    float t = turns - (float)(int)turns; if (t < 0) t += 1.0f;
+    float x = (t + (cosine ? 0.25f : 0.0f)) * 64.0f; int i = (int)x; float fr = x - (float)i; i &= 63; int j = (i + 1) & 63;
+    return cube_sin[i] + (cube_sin[j] - cube_sin[i]) * fr;
+}
+static void cube_matrix(uint32_t frame, int flip, float *m) {
+    float a = (float)frame * 6.0f / 90.0f;              /* turns: frame*6/90 of 2*pi (keyframe step 6 of 90) */
+    float b = a * 0.5f + 0.4f / 6.28318531f;
+    float ca = cube_trig(a, 1), sa = cube_trig(a, 0), cb = cube_trig(b, 1), sb = cube_trig(b, 0);
+    float r[3][3] = { { ca, sa * sb, sa * cb }, { 0, cb, -sb }, { -sa, ca * sb, ca * cb } };    /* Ry(a) * Rx(b) */
+    const float s = 0.8f, f = 1.7320508f, asp = 240.0f / 432.0f, n = 1.0f, fa = 10.0f;
+    float mv[3][4]; for (int i = 0; i < 3; ++i) { for (int j = 0; j < 3; ++j) mv[i][j] = r[i][j] * s; mv[i][3] = 0; } mv[2][3] = -5.0f;
+    float P[4][4] = { { f / asp, 0, 0, 0 }, { 0, f, 0, 0 }, { 0, 0, (fa + n) / (n - fa), 2 * fa * n / (n - fa) }, { 0, 0, -1, 0 } };
+    float full[4][4];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+        float acc = 0; for (int k2 = 0; k2 < 3; ++k2) acc += P[i][k2] * mv[k2][j];
+        acc += P[i][3] * (j == 3 ? 1.0f : 0.0f); full[i][j] = acc;
+    }
+    if (flip) for (int j = 0; j < 4; ++j) { full[0][j] = -full[0][j]; full[1][j] = -full[1][j]; }
+    for (int c = 0; c < 4; ++c) for (int r2 = 0; r2 < 4; ++r2) m[c * 4 + r2] = full[r2][c];
+}
+static uint32_t api_submissions, api_words, api_syncs;
+static int api_texture_sync(void *user, void *cpu, uint32_t va, uint32_t bytes) {
+    (void)user;
+    /* Texture arena is in the uncached 0x08300000 section; only order writes.
+     * No cache maintenance or wait is implied for other caller-supplied arenas. */
+    if (cpu != (void *)(0x08000000u + CUBE_TEXVA) || va != CUBE_TEXVA || bytes != 1024) return -1;
+    __asm__ volatile("dsb sy" ::: "memory"); ++api_syncs; return 0;
+}
+static int api_submit(const uint32_t *seg, uint32_t words, void *user) {
+    (void)user; ++api_submissions; api_words = words;
+    mbx_submit_seg(seg, words, MBX_CK_TRI); return 0;
+}
+/* Real-device check of the same source/API workload image-tested on the host.
+ * Persist a separate result; never count a compiler-only pass as a GPU pass. */
+static void api_smoke(uint32_t objects) {
+    static gl2_ctx ctx; static gl2_prog_obj progs[4]; static uint32_t seg[512];
+    uint32_t glerr = 0, px[4] = {0,0,0,0}, us = 0; int stage = 6, render_rc = -1;
+    static const uint16_t probe_x[4] = {60,180,60,180}, probe_y[4] = {108,108,324,324};
+    static const uint8_t obj_exp[4] = {96,128,32,64};
+    api_submissions = api_words = api_syncs = 0;
+    mbx_variant = R5F | MBX_V_PFX;
+    if (mbx_init()) {
+        volatile uint32_t *tex = (volatile uint32_t *)(0x08000000u + CUBE_TEXVA);
+        for (uint32_t i = 0; i < 256; ++i) tex[i] = 0xffffffffu;
+        for (uint32_t i = 0; i < W * H; ++i) target[i] = 0xff00ff00u;
+        __asm__ volatile("dsb sy" ::: "memory");
+        mbx_set_background(0xffff00ffu); mbx_set_target(target, W, H, W);
+        mbx_begin(); mbx_submit_seg(s0, 20, MBX_CK_S0);
+        mbx_submit_seg(s1, 20, MBX_CK_S1); mbx_submit_seg(s2, 17, MBX_CK_S2);
+        uint32_t start = USEC;
+        if (objects) stage = gl2_object_smoke_draw(&ctx, progs, seg, 512, api_submit, 0,
+            (void *)(0x08000000u + CUBE_TEXVA), CUBE_TEXVA, api_texture_sync, 0, &glerr);
+        else stage = gl2_smoke_draw(&ctx, progs, seg, 512, api_submit, 0, CUBE_TEXVA, &glerr);
+        us = USEC - start;
+        if (!stage && api_submissions == 1) {
+            render_rc = mbx_render(target, W, H, W) | mbx_wait_done(50000);
+            __asm__ volatile("dsb sy" ::: "memory");
+            for (uint32_t i = 0; i < 4; ++i) px[i] = target[probe_y[i] * W + probe_x[i]];
+        }
+        mbx_halt();
+    }
+    mbx_variant = 0;
+    int good = !stage && !glerr && !render_rc && api_submissions == 1 && (!objects || api_syncs == 2);
+    for (uint32_t i = 0; i < 4; ++i) for (uint32_t shift = 0; shift < 24; shift += 8) {
+        int v = (int)((px[i] >> shift) & 255u), exp = objects ? obj_exp[i] : 128;
+        if (v < exp - 1 || v > exp + 1) good = 0;
+    }
+    fmt_out = auto_rep; while (*fmt_out) ++fmt_out;
+    fmt_str(objects ? "API objects " : "API client "); fmt_str(good ? "OK " : "BAD ");
+    fmt_str("stage "); fmt_dec((uint32_t)stage); fmt_str(" glerr "); fmt_hex(glerr, 4); fmt_line(0, 0, 0);
+    fmt_str("API render rc "); fmt_hex((uint32_t)render_rc, 8); fmt_str(" syncs "); fmt_dec(api_syncs); fmt_line(0, 0, 0);
+    for (uint32_t i = 0; i < 4; ++i) {
+        uint32_t exp = objects ? obj_exp[i] : 128;
+        fmt_str("API probe "); fmt_dec(i); fmt_str(" got "); fmt_hex(px[i] & 0xffffffu, 6);
+        fmt_str(" exp "); fmt_hex(exp * 0x010101u, 6); fmt_line(0, 0, 0);
+    }
+    fmt_str("API draws "); fmt_dec(api_submissions); fmt_str(" words "); fmt_dec(api_words); fmt_line(0, 0, 0);
+    fmt_str("API compile+upload+submit us "); fmt_dec(us); fmt_line(0, 0, 0);
+    uint32_t len = (uint32_t)(fmt_out - auto_rep); fmt_out = 0;
+    rpt_mirror_write(auto_rep, len, rpt_sum(auto_rep, len));
+}
+void mbx_autorun(void) {
+#if NANOOS_AUTORUN
+    static uint32_t got[CVN], rcs[CVN];
+    uint32_t pass = 0, bad[CVN], nbad = 0;
+    fmt_out = auto_rep; fmt_end = auto_rep + sizeof auto_rep - 64;
+    fmt_str("NANOOS AUTO tests "); fmt_dec(CVN); fmt_str(" build " __DATE__ " " __TIME__); fmt_line(0, 0, 0);
+    mbx.scenes = mbx.jobs = mbx.timeouts = 0;
+    d1_build();
+    for (uint32_t k = 0; k < CVN; ++k) {
+        fmt_out = 0;                       /* busy() draws; restore after */
+        busy("hw suite", k * 100u / CVN);
+        fmt_out = auto_rep + (fmt_out ? 0 : 0);
+        got[k] = 0; rcs[k] = 0xffu;
+        mbx_variant = R5F | MBX_V_PFX | MBX_V_DIAG;
+        if (mbx_init()) {
+            if (cv_hastd[k]) {
+                volatile uint32_t *t0 = (volatile uint32_t *)(0x08000000u + CV_T0VA);
+                volatile uint32_t *t1 = (volatile uint32_t *)(0x08000000u + CV_T1VA);
+                for (int i = 0; i < 256; ++i) { t0[i] = cv_td_0[i]; t1[i] = cv_td_1[i]; }
+            } else if (cv_tex[k][0]) {
+                volatile uint32_t *t0 = (volatile uint32_t *)(0x08000000u + CV_T0VA);
+                volatile uint32_t *t1 = (volatile uint32_t *)(0x08000000u + CV_T1VA);
+                for (int i = 0; i < 256; ++i) { t0[i] = cv_tex[k][0]; t1[i] = cv_tex[k][1]; }
+            }
+            for (int i = 0; i < W * H; ++i) target[i] = 0xff00ff00u;
+            __asm__ volatile("dsb sy" ::: "memory");
+            mbx_set_background(0xffff00ffu);
+            mbx_set_target(target, W, H, W);
+            mbx_begin();
+            mbx_submit_seg(s0, 20, MBX_CK_S0);
+            mbx_submit_seg(s1, 20, MBX_CK_S1);
+            mbx_submit_seg(s2, 17, MBX_CK_S2);
+            if (cv_scene[k]) {          /* [dlen, depth-clear words..] then [len, draw words..]* */
+                const uint32_t *q = cv_seg[k], *e = q + cv_len[k];
+                uint32_t dl = *q++;
+                mbx_submit_seg(q, dl, MBX_CK_S2); q += dl;
+                while (q < e) { uint32_t n = *q++; mbx_submit_seg(q, n, MBX_CK_TRI); q += n; }
+            } else mbx_submit_seg(cv_seg[k], cv_len[k], MBX_CK_TRI);
+            int r = mbx_render(target, W, H, W) | mbx_wait_done(50000);
+            __asm__ volatile("dsb sy" ::: "memory");
+            rcs[k] = (uint32_t)r & 0xffu;
+            got[k] = target[cv_px[k][1] * W + cv_px[k][0]];
+            mbx_halt();
+        }
+    }
+    mbx_variant = 0;
+    fmt_out = auto_rep; while (*fmt_out) ++fmt_out;
+    for (uint32_t k = 0; k < CVN; ++k) {
+        int dr = (int)((got[k] >> 16) & 255) - cv_exp[k][0], dg = (int)((got[k] >> 8) & 255) - cv_exp[k][1],
+            db = (int)(got[k] & 255) - cv_exp[k][2], t = cv_tol[k];
+        int good = rcs[k] == 0 && dr <= t && dr >= -t && dg <= t && dg >= -t && db <= t && db >= -t;
+        pass += (uint32_t)good; if (!good) bad[nbad++] = k;
+        fmt_dec(k); fmt_str(good ? " OK  " : " BAD "); fmt_str(cv_name[k]);
+        fmt_str(" exp "); auto_hex((uint32_t)cv_exp[k][0] << 16 | (uint32_t)cv_exp[k][1] << 8 | cv_exp[k][2], 6);
+        fmt_str(" got "); auto_hex(got[k] & 0xffffffu, 6); fmt_str(" rc "); fmt_dec(rcs[k]);
+        fmt_line(0, 0, 0);
+    }
+    fmt_str("PASS "); fmt_dec(pass); fmt_str("/"); fmt_dec(CVN); fmt_str(" END"); fmt_line(0, 0, 0);
+    {   uint32_t l0 = (uint32_t)(fmt_out - auto_rep); fmt_out = 0;
+        rpt_mirror_write(auto_rep, l0, rpt_sum(auto_rep, l0));   /* table results saved before the cube phase */
+    }
+    api_smoke(0);
+    api_smoke(1);
+    {   volatile uint32_t *t0 = (volatile uint32_t *)(0x08000000u + CUBE_TEXVA);
+        for (int i = 0; i < 256; ++i) t0[i] = cube_tex[i]; }
+    /* ---- end-to-end loop, frames built ON THE DEVICE by gl2rt from a program blob + uniforms + vertex arrays (60 frames each, one init):
+     *  0: GPU -> target, CPU reversed copy to the LCD buffer (normal matrices)
+     *  1: GPU renders straight into the LCD back buffer using the 180-degree-rotated matrices (no copy) */
+    static uint32_t ph_sub[2], ph_gpu[2], ph_copy[2], ph_push[2], ph_tot[2], e_ok[2], d_px[2];
+    static gl2_program gp; static uint32_t gseg[512]; int gl_err = gl2_program_load(&gp, cube_blob, CUBE_BLOB_BYTES);
+    for (uint32_t mode = 0; mode < 2 && !gl_err; ++mode) {
+        mbx_variant = R5F | MBX_V_PFX;
+        if (mbx_init()) {
+            mbx_set_background(0xffff00ffu);
+            int loc = gl2_uniform_loc(&gp, "uM"); gl2_state gs = { 0, 1, 0, 1, 0x201, 1 }; gl2_tex gt[2] = { { CUBE_TEXVA, 4, 0 }, { CUBE_TEXVA, 4, 0 } };
+            for (uint32_t f = 0; f < 60; ++f) {
+                while (!lcd_ready()) lcd_service();
+                uint32_t *dst = lcd_back(), *tgt = mode ? dst : target; mbx_set_target(tgt, W, H, W);
+                uint32_t t0 = USEC, k = f % 15;
+                float mm[16]; cube_matrix(k, (int)mode, mm); gl2_uniform_matrix4(&gp, loc, mm);
+                int n = gl2_build_draw(&gp, &gs, 4, 36, cube_pos, cube_col, cube_uv, 0, gt, W, H, gseg, 512);
+                if (n < 0) break;
+                mbx_begin();
+                mbx_submit_seg(s0, 20, MBX_CK_S0); mbx_submit_seg(s1, 20, MBX_CK_S1);
+                mbx_submit_seg(cube_dclr, 17, MBX_CK_S2); mbx_submit_seg(gseg, (uint32_t)n, MBX_CK_TRI);
+                uint32_t t1 = USEC;
+                int r = mbx_render(tgt, W, H, W) | mbx_wait_done(50000);
+                uint32_t t2 = USEC;
+                if (r) break;
+                if (!mode) { const uint32_t *sp = target; uint32_t *dp = dst + W * H - 1; for (uint32_t i = 0; i < W * H; ++i) *dp-- = *sp++; }
+                uint32_t t3 = USEC;
+                if (f == 12) d_px[mode] = mode ? dst[(W * H - 1) - (100 * W + 60)] : target[100 * W + 60];
+                lcd_present(); while (lcd_busy()) lcd_service();
+                uint32_t t4 = USEC;
+                ++e_ok[mode]; ph_sub[mode] += t1 - t0; ph_gpu[mode] += t2 - t1; ph_copy[mode] += t3 - t2; ph_push[mode] += t4 - t3; ph_tot[mode] += t4 - t0;
+            }
+            mbx_halt();
+        }
+        mbx_variant = 0;
+    }
+    fmt_out = auto_rep; while (*fmt_out) ++fmt_out;
+    for (uint32_t m = 0; m < 2; ++m) {
+        uint32_t n = e_ok[m] ? e_ok[m] : 1;
+        fmt_str("E2E mode "); fmt_dec(m); fmt_str(" n "); fmt_dec(e_ok[m]); fmt_str(" tot "); fmt_dec(ph_tot[m] / n); fmt_line(0, 0, 0);
+        fmt_str("  sub "); fmt_dec(ph_sub[m] / n); fmt_str(" gpu "); fmt_dec(ph_gpu[m] / n); fmt_line(0, 0, 0);
+        fmt_str("  copy "); fmt_dec(ph_copy[m] / n); fmt_str(" push "); fmt_dec(ph_push[m] / n); fmt_line(0, 0, 0);
+    }
+    fmt_str("GL2RT load err "); fmt_dec((uint32_t)gl_err); fmt_line(0, 0, 0);
+    fmt_str("ORIENT copy-path px "); fmt_hex(d_px[0] & 0xffffffu, 6); fmt_str(" matrix-flip px "); fmt_hex(d_px[1] & 0xffffffu, 6); fmt_line(0, 0, 0);
+    uint32_t len = (uint32_t)(fmt_out - auto_rep);
+    fmt_out = 0;
+    rpt_mirror_write(auto_rep, len, rpt_sum(auto_rep, len));
+    lcd_clear(0xff101010);
+    page_total = 0;
+    fmt_str("NanoOS hw suite pass "); fmt_dec(pass); fmt_str("/"); fmt_dec(CVN); fmt_line(4, 4, WHITE);
+    for (uint32_t i = 0; i < nbad && i < 20; ++i) {
+        uint32_t k = bad[i];
+        fmt_dec(k); fmt_str(" "); fmt_str(cv_name[k]); fmt_str(" "); auto_hex(got[k] & 0xffffffu, 6);
+        fmt_line(4, 16 + (int)i * 10, 0xffff4040u);
+    }
+    fmt_str("returning to the iPod..."); fmt_line(4, 226, WHITE);
+    lcd_flush();
+    uint32_t t0 = USEC;
+    while (USEC - t0 < 6000000u) lcd_service();
+#endif
 }

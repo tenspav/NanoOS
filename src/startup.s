@@ -31,6 +31,10 @@ _start:
     mov r0, #0x40000000
     .fpu vfpv4-d16
     vmsr fpexc, r0
+    /* Define the game FP environment: round-to-nearest, exceptions disabled,
+     * IEEE subnormals/NaNs rather than inheriting RetailOS thread state. */
+    mov r0, #0
+    vmsr fpscr, r0
     ldr sp, =_stack_top
     /* An asset pack (NPAK v1, asset.h) appended to the image starts at
      * __data_end, or at the next 4 KiB boundary when the loader handed over
